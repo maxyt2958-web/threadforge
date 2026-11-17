@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org">
+<body>
+<th:block th:fragment="mark(cls)">
+    <img th:if="${appHasCustomLogo}" th:src="${appLogoUrl}" th:class="${cls}" alt=""/>
+    <svg th:unless="${appHasCustomLogo}" th:class="${cls}" viewBox="0 0 64 64" role="img"
+         aria-label="ThreadForge" xmlns="http://www.w3.org/2000/svg">
+        <title th:text="${appTitle}">ThreadForge</title>
+        <polygon class="to-logo-ring" points="32,4 56,18 56,46 32,60 8,46 8,18" fill="none" stroke-width="3"/>
+        <path class="to-logo-thread" d="M19 23 H45 M32 23 V46" fill="none" stroke-width="6" stroke-linecap="round"/>
+        <path class="to-logo-core" d="M32 34 H43" fill="none" stroke="currentColor" stroke-width="4.5" stroke-linecap="round"/>
+        <polygon class="to-logo-bead" points="46,15 50,19 46,23 42,19"/>
+    </svg>
+</th:block>
+</body>
+</html>

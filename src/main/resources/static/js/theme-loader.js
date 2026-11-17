@@ -1,0 +1,54 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Picks the highlight.js stylesheet that matches the active theme. Loaded by channels.html
+ * before chat.js so the theme is in place by the time messages render. Lives in a static
+ * file (instead of an inline <script>) so the page can run under a strict CSP that
+ * disallows 'unsafe-inline' for script-src.
+ */
+(function () {
+  // Every dark theme, not just the one literally named "dark" — kept in step with the
+  // "Structural, not palette" selector list in app.css (search that comment before adding a
+  // sixth). Missing one here doesn't break layout, just contrast: the light hljs theme's
+  // near-black token colors land on that theme's dark message-code background and the
+  // highlighting becomes unreadable rather than absent, which is easy to miss in review.
+  var DARK_THEMES = ['dark', 'midnight', 'carbon', 'forest', 'dusk'];
+  function isDark() {
+    var theme = (document.body && document.body.dataset && document.body.dataset.theme) || 'default';
+    return DARK_THEMES.indexOf(theme) !== -1;
+  }
+  // The same answer for anything else that draws in the theme's colours — chat-kit.js asks it
+  // which Mermaid theme to draw diagrams in — so this list stays the only copy.
+  window.ChatTheme = { isDark: isDark };
+  function injectHljsStylesheet() {
+    var dark = isDark();
+    var link = document.createElement('link');
+    link.rel = 'stylesheet';
+    link.href = dark
+        ? '/css/vendor/highlight-github-dark.min.css'
+        : '/css/vendor/highlight-github.min.css';
+    link.onerror = function () {
+      console.warn('[hljs] stylesheet failed to load:', link.href);
+    };
+    document.head.appendChild(link);
+  }
+  if (document.body) {
+    injectHljsStylesheet();
+  } else {
+    document.addEventListener('DOMContentLoaded', injectHljsStylesheet, { once: true });
+  }
+})();

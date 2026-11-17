@@ -1,0 +1,217 @@
+<!--
+  Copyright 2026 ThreadForge
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<body>
+<!--/*
+  The application top bar: logo, the one message-search box, mention bell, avatar link, sign-out
+  form.
+
+  Rendered by every signed-in page through this one fragment. It used to be copied into each
+  template, which is how the direct-message page ended up with an empty <div class="topbar-center">
+  and no message search at all — a whole feature missing from a page because a block was copied
+  before that feature existed.
+
+  The fragment now closes every element it opens, including the </header>. It used to stop halfway
+  down the mention-bell panel and leave each including page to finish the markup, so the same
+  eighteen lines of bell list, avatar link and logout form were copied into channels.html and
+  conversation.html — the exact duplication the fragment exists to prevent, reintroduced inside it.
+  A third page needing a top bar was the point at which that had to stop.
+
+  Model attributes read here, all optional and all already set by every page that renders a top bar:
+    searchQuery            prefills the box, so the results page shows what was searched for
+    activeChannelId        \ carried into /search as "where this search started", which is what the
+    activeConversationId   / results page builds its way-back link from
+*/-->
+<th:block th:fragment="topbar">
+<header class="topbar">
+    <div class="topbar-left">
+        <button type="button" id="sidebar-toggle" class="sidebar-toggle"
+                aria-label="Toggle channel list" aria-controls="app-sidebar" aria-expanded="false">
+            <span class="sidebar-toggle-bar"></span>
+            <span class="sidebar-toggle-bar"></span>
+            <span class="sidebar-toggle-bar"></span>
+        </button>
+        <a th:href="@{/channels}" class="logo">
+            <th:block th:replace="~{fragments/logo :: mark('logo-mark')}"/>
+            <span class="logo-text" th:text="${appTitle}">ThreadForge</span>
+        </a>
+    </div>
+    <div class="topbar-center">
+        <!--/* A real GET form to /search, not a JavaScript-only box. Enter therefore lands on the
+               results page by default; the live dropdown only intercepts it when the user has
+               arrowed to a specific row, i.e. when they have said which result they meant. It used
+               to guess the top hit and navigate there, which threw you into a channel you had not
+               asked for with no way back. */-->
+        <form class="search-form" id="global-search-form" method="get" th:action="@{/search}"
+              th:with="searchWhere=${activeChannel != null ? '#' + activeChannel.name
+                                     : (activeConversationId != null ? 'this conversation' : 'messages')}">
+            <span class="search-field">
+                <!--/* The placeholder names the scope the hidden fields below impose. A box that
+                       silently narrows itself to the room you happen to be in is the same class of
+                       bug as one that silently means the opposite of what you typed; saying so is
+                       what makes the pre-selection a convenience rather than a trap. Widening is
+                       one control away on the results page, or in:#channel from here. */-->
+                <input type="search" id="global-search-input" name="q"
+                       th:value="${searchQuery} ?: ''"
+                       th:placeholder="'Search ' + ${searchWhere} + '…'"
+                       th:aria-label="'Search ' + ${searchWhere}"
+                       placeholder="Search messages…" minlength="2" required
+                       autocomplete="off"/>
+                <button type="button" class="search-clear" tabindex="-1" hidden
+                        title="Clear search" aria-label="Clear search">
+                    <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-close"/></svg>
+                </button>
+            </span>
+            <!--/* Where the search started. Rendered only when there is one, so an absent origin
+                   is an absent parameter rather than an empty string the binder has to guess at. */-->
+            <input type="hidden" name="channelId" th:if="${activeChannelId != null}"
+                   th:value="${activeChannelId}"/>
+            <input type="hidden" name="conversationId" th:if="${activeConversationId != null}"
+                   th:value="${activeConversationId}"/>
+            <button type="submit">Search</button>
+        </form>
+    </div>
+    <div class="topbar-right">
+        <button type="button" id="p2p-share-btn" class="topbar-bell-btn p2p-topbar-btn"
+                title="P2P LAN File Share" aria-label="P2P LAN File Share">
+            <svg class="icon" aria-hidden="true"><use href="#icon-p2p"/></svg>
+            <span class="p2p-topbar-label">P2P</span>
+        </button>
+        <div class="topbar-bell" id="topbar-bell">
+            <button type="button" id="topbar-bell-btn" class="topbar-bell-btn"
+                    aria-haspopup="dialog" aria-expanded="false" aria-controls="topbar-bell-panel"
+                    title="Mentions" aria-label="Mentions">
+                <svg class="icon"><use href="#icon-bell"/></svg>
+                <span class="topbar-bell-count" id="topbar-bell-count" hidden>0</span>
+            </button>
+            <div class="topbar-bell-panel" id="topbar-bell-panel" role="dialog"
+                 aria-label="Mentions" hidden>
+                <header class="topbar-bell-header">
+                    <h3>Mentions</h3>
+                    <button type="button" id="topbar-bell-mark-all" class="topbar-bell-action"
+                            title="Mark every channel with unread mentions as read">Mark all as read</button>
+                </header>
+                <ul class="topbar-bell-list" id="topbar-bell-list"></ul>
+                <p class="topbar-bell-empty" id="topbar-bell-empty">You're all caught up.</p>
+            </div>
+        </div>
+        <a th:href="@{/profile}" class="me" title="Profile settings">
+            <span class="avatar" th:data-author="${me.username}">
+                <img th:if="${me.hasAvatar()}" class="avatar-image" alt=""
+                     th:src="@{/api/users/{u}/avatar(u=${me.username},v=${me.avatarVersion()})}"/>
+                <span class="avatar-letter"
+                      th:text="${#strings.toUpperCase(#strings.substring(me.displayName ?: me.username, 0, 1))}">U</span>
+            </span>
+            <span th:text="${me.displayName ?: me.username}">user</span>
+        </a>
+        <!-- Submitted by the avatar dropdown's "Sign out" item (presence-menu.js);
+             kept as a hidden form so the POST carries the Thymeleaf CSRF token. -->
+        <form id="logout-form" th:action="@{/logout}" method="post" hidden></form>
+    </div>
+</header>
+
+<dialog id="p2p-share-dialog" class="p2p-dialog" closedby="any" aria-labelledby="p2p-share-title">
+    <div class="p2p-dialog-shell">
+        <header class="p2p-dialog-header">
+            <div>
+                <h2 id="p2p-share-title">LAN P2P File &amp; Folder Sharing</h2>
+                <p class="p2p-subtitle" id="p2p-network-info">
+                    Share files and folders across devices on the same local network (Fandem protocol).
+                </p>
+            </div>
+            <button type="button" id="p2p-close-btn" class="icon-btn" title="Close" aria-label="Close">
+                <svg class="icon" aria-hidden="true"><use href="#icon-close"/></svg>
+            </button>
+        </header>
+
+        <div class="p2p-tabs" role="tablist" aria-label="P2P transfer mode">
+            <button type="button" role="tab" id="p2p-tab-send" class="p2p-tab is-active"
+                    aria-selected="true" aria-controls="p2p-panel-send">Send files / folder</button>
+            <button type="button" role="tab" id="p2p-tab-receive" class="p2p-tab"
+                    aria-selected="false" aria-controls="p2p-panel-receive">Receive</button>
+        </div>
+
+        <p id="p2p-status-banner" class="p2p-status" role="status" aria-live="polite" hidden></p>
+
+        <section id="p2p-panel-send" class="p2p-panel" role="tabpanel" aria-labelledby="p2p-tab-send">
+            <div id="p2p-dropzone" class="p2p-dropzone" tabindex="0">
+                <svg class="icon p2p-dropzone-icon" aria-hidden="true"><use href="#icon-p2p"/></svg>
+                <p class="p2p-dropzone-title">Drop files or a folder here, or choose from this device</p>
+                <p class="p2p-dropzone-hint" id="p2p-size-hint">
+                    Broadcasts on your local network for Android, Desktop, CLI, or browser peers. Folders are packed as a ZIP preserving subfolders.
+                </p>
+                <div class="p2p-dropzone-actions">
+                    <button type="button" id="p2p-pick-file-btn" class="p2p-primary-btn" autofocus>
+                        Choose files
+                    </button>
+                    <button type="button" id="p2p-pick-folder-btn" class="p2p-secondary-btn p2p-folder-btn">
+                        Choose folder
+                    </button>
+                </div>
+                <input type="file" id="p2p-file-input" multiple hidden/>
+                <input type="file" id="p2p-folder-input" webkitdirectory directory multiple hidden/>
+            </div>
+
+            <div id="p2p-upload-wrap" class="p2p-progress-wrap" hidden>
+                <div class="p2p-progress-head">
+                    <span id="p2p-upload-label">Preparing P2P share…</span>
+                    <span id="p2p-upload-pct">0%</span>
+                </div>
+                <progress id="p2p-upload-progress" class="p2p-progress" max="100" value="0"></progress>
+            </div>
+
+            <div class="p2p-section">
+                <h3>Your active P2P shares</h3>
+                <ul id="p2p-my-shares" class="p2p-list"></ul>
+                <p id="p2p-my-shares-empty" class="p2p-empty">No active shares right now.</p>
+            </div>
+        </section>
+
+        <section id="p2p-panel-receive" class="p2p-panel" role="tabpanel" aria-labelledby="p2p-tab-receive" hidden>
+            <form id="p2p-key-form" class="p2p-key-form">
+                <label for="p2p-key-input">Connect using a Fandem Peer Key or host:port</label>
+                <div class="p2p-key-row">
+                    <input id="p2p-key-input" type="text" name="target" autocomplete="off"
+                           autocorrect="off" autocapitalize="none" spellcheck="false" enterkeyhint="go"
+                           placeholder="e.g. 0A0D59B401 or 10.13.89.180:8082" maxlength="64" required/>
+                    <button type="submit" id="p2p-key-submit" class="p2p-primary-btn">Receive</button>
+                </div>
+            </form>
+
+            <div id="p2p-receive-wrap" class="p2p-progress-wrap" hidden>
+                <div class="p2p-progress-head">
+                    <span id="p2p-receive-label">Receiving and verifying SHA-256…</span>
+                </div>
+                <progress id="p2p-receive-progress" class="p2p-progress"></progress>
+            </div>
+
+            <div class="p2p-section">
+                <div class="p2p-section-head">
+                    <h3>Nearby senders on your network</h3>
+                    <button type="button" id="p2p-refresh-btn" class="p2p-secondary-btn">Refresh</button>
+                </div>
+                <ul id="p2p-lan-list" class="p2p-list"></ul>
+                <p id="p2p-lan-empty" class="p2p-empty">
+                    Listening for nearby peers… Start a share on another device on the same Wi-Fi/LAN.
+                </p>
+            </div>
+        </section>
+    </div>
+</dialog>
+</th:block>
+</body>
+</html>

@@ -1,0 +1,347 @@
+<!--
+  Inline SVG sprite. Templates pull this in once near the top of <body> via
+  <th:block th:replace="~{fragments/icon-sprite :: sprite}"/>. Call sites then
+  reference symbols with:
+
+    <svg class="icon"><use href="#icon-cog"/></svg>          (20×20, button-sized)
+    <svg class="icon icon-sm"><use href="#icon-lock"/></svg> (14×14, inline marker)
+
+  Uniform 24×24 viewBox so every symbol scales identically. Path data is from
+  Heroicons (MIT, © Tailwind Labs) — see THIRD-PARTY-NOTICES.md for the notice
+  this attribution is required by. Swap individual symbols freely, just keep the
+  viewBox, and keep new ones from the same set so the stroke weights match.
+-->
+<svg th:fragment="sprite" xmlns="http://www.w3.org/2000/svg"
+     style="position:absolute;width:0;height:0;overflow:hidden" aria-hidden="true">
+    <defs>
+
+        <!-- Bell (mentions inbox) -->
+        <symbol id="icon-bell" viewBox="0 0 24 24">
+            <path fill="currentColor"
+                  d="M12 22a2.5 2.5 0 0 0 2.45-2H9.55A2.5 2.5 0 0 0 12 22Zm7-6V11a7 7 0 0 0-5.5-6.83V3.5a1.5 1.5 0 1 0-3 0v.67A7 7 0 0 0 5 11v5l-2 2v1h18v-1Z"/>
+        </symbol>
+
+        <!-- Bell with a slash (muted channel). Outline rather than the filled #icon-bell: it sits
+             at 14px beside a dimmed channel name and a solid glyph at that size reads as louder
+             than the row it is qualifying. -->
+        <symbol id="icon-bell-slash" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M9.143 17.082a24.248 24.248 0 0 0 3.844.148m-3.844-.148a23.856 23.856 0 0 1-5.455-1.31 8.964 8.964 0 0 0 2.3-5.542m3.155 6.852a3 3 0 0 0 5.667 1.97m1.965-2.277L21 21m-4.225-4.225a23.81 23.81 0 0 0 3.536-1.003A8.967 8.967 0 0 1 18 9.75V9A6 6 0 0 0 6.53 6.53m10.245 10.245L6.53 6.53M3 3l3.53 3.53"/>
+        </symbol>
+
+        <!-- Cog (settings / admin console) -->
+        <symbol id="icon-cog" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.325.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 0 1 1.37.49l1.296 2.247a1.125 1.125 0 0 1-.26 1.431l-1.003.827c-.293.241-.438.613-.43.992a7.723 7.723 0 0 1 0 .255c-.008.378.137.75.43.991l1.004.827c.424.35.534.955.26 1.43l-1.298 2.247a1.125 1.125 0 0 1-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.47 6.47 0 0 1-.22.128c-.331.183-.581.495-.644.869l-.213 1.281c-.09.543-.56.94-1.11.94h-2.594c-.55 0-1.019-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 0 1-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 0 1-1.369-.49l-1.297-2.247a1.125 1.125 0 0 1 .26-1.431l1.004-.827c.292-.24.437-.613.43-.991a6.932 6.932 0 0 1 0-.255c.007-.38-.138-.751-.43-.992l-1.004-.827a1.125 1.125 0 0 1-.26-1.43l1.297-2.247a1.125 1.125 0 0 1 1.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28Z"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/>
+        </symbol>
+
+        <!-- Chart bar (poll) -->
+        <symbol id="icon-poll" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M3 13.125C3 12.504 3.504 12 4.125 12h2.25c.621 0 1.125.504 1.125 1.125v6.75C7.5 20.496 6.996 21 6.375 21h-2.25A1.125 1.125 0 0 1 3 19.875v-6.75ZM9.75 8.625c0-.621.504-1.125 1.125-1.125h2.25c.621 0 1.125.504 1.125 1.125v11.25c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V8.625ZM16.5 4.125c0-.621.504-1.125 1.125-1.125h2.25C20.496 3 21 3.504 21 4.125v15.75c0 .621-.504 1.125-1.125 1.125h-2.25a1.125 1.125 0 0 1-1.125-1.125V4.125Z"/>
+        </symbol>
+
+        <!-- User plus (invite someone to a channel or group) -->
+        <symbol id="icon-user-plus" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M18 7.5v3m0 0v3m0-3h3m-3 0h-3m-2.25-4.125a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0ZM3 19.235v-.11a6.375 6.375 0 0 1 12.75 0v.109A12.318 12.318 0 0 1 9.374 21c-2.331 0-4.512-.645-6.374-1.766Z"/>
+        </symbol>
+
+        <!-- Users (members list) -->
+        <symbol id="icon-users" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M15 19.128a9.38 9.38 0 0 0 2.625.372 9.337 9.337 0 0 0 4.121-.952 4.125 4.125 0 0 0-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 0 1 8.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0 1 11.964-3.07M12 6.375a3.375 3.375 0 1 1-6.75 0 3.375 3.375 0 0 1 6.75 0Zm8.25 2.25a2.625 2.625 0 1 1-5.25 0 2.625 2.625 0 0 1 5.25 0Z"/>
+        </symbol>
+
+        <!-- Clock — the time-zone prompt and anything else about when, not what -->
+        <symbol id="icon-clock" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M12 6v6l4 2m5-2a9 9 0 1 1-18 0 9 9 0 0 1 18 0Z"/>
+        </symbol>
+
+        <!-- × close -->
+        <symbol id="icon-close" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                  d="M6 18 18 6M6 6l12 12"/>
+        </symbol>
+
+        <!-- ← back / previous page -->
+        <symbol id="icon-arrow-left" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                  d="M19 12H5m0 0 6-6m-6 6 6 6"/>
+        </symbol>
+
+        <!-- → next page -->
+        <symbol id="icon-arrow-right" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                  d="M5 12h14m0 0-6-6m6 6-6 6"/>
+        </symbol>
+
+        <!-- + plus -->
+        <symbol id="icon-plus" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                  d="M12 4.5v15m7.5-7.5h-15"/>
+        </symbol>
+
+        <!-- Paper clip (attachment) -->
+        <symbol id="icon-paperclip" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m18.375 12.739-7.693 7.693a4.5 4.5 0 0 1-6.364-6.364l10.94-10.94A3 3 0 1 1 19.5 7.372L8.552 18.32m.009-.01-.01.01m5.699-9.941-7.81 7.81a1.5 1.5 0 0 0 2.112 2.13"/>
+        </symbol>
+
+        <!-- Arrow down to tray (download) -->
+        <symbol id="icon-download" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M3 16.5v2.25A2.25 2.25 0 0 0 5.25 21h13.5A2.25 2.25 0 0 0 21 18.75V16.5M16.5 12 12 16.5m0 0L7.5 12m4.5 4.5V3"/>
+        </symbol>
+
+        <!-- Eye (show a file's contents in place) -->
+        <symbol id="icon-eye" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M2.036 12.322a1.012 1.012 0 0 1 0-.639C3.423 7.51 7.36 4.5 12 4.5c4.638 0 8.573 3.007 9.963 7.178.07.207.07.431 0 .639C20.577 16.49 16.64 19.5 12 19.5c-4.638 0-8.573-3.007-9.964-7.178Z"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M15 12a3 3 0 1 1-6 0 3 3 0 0 1 6 0Z"/>
+        </symbol>
+
+        <!-- Lock (private channel) -->
+        <symbol id="icon-lock" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z"/>
+        </symbol>
+
+        <!-- Key (one-time secrets) -->
+        <symbol id="icon-key" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M15.75 5.25a3 3 0 0 1 3 3m3 0a6 6 0 0 1-7.029 5.912c-.563-.097-1.159.026-1.563.43L10.5 17.25H8.25v2.25H6v2.25H2.25v-2.818c0-.597.237-1.17.659-1.591l6.499-6.499c.404-.404.527-1 .43-1.563A6 6 0 1 1 21.75 8.25Z"/>
+        </symbol>
+
+        <!-- Camera (the "don't photograph this" warning on a revealed secret) -->
+        <symbol id="icon-camera" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M6.827 6.175A2.31 2.31 0 0 1 5.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 0 0 2.25 2.25h15A2.25 2.25 0 0 0 21.75 18V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 0 0-1.134-.175 2.31 2.31 0 0 1-1.64-1.055l-.822-1.316a2.192 2.192 0 0 0-1.736-1.039 48.774 48.774 0 0 0-5.232 0 2.192 2.192 0 0 0-1.736 1.039l-.821 1.316Z"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M16.5 12.75a4.5 4.5 0 1 1-9 0 4.5 4.5 0 0 1 9 0ZM18.75 10.5h.008v.008h-.008V10.5Z"/>
+        </symbol>
+
+        <!-- Star, outline (a channel you have NOT starred). Paired with the filled #icon-star:
+             the outline/filled pair is what makes the control read as a toggle at 14px, where a
+             colour change alone is too small a difference to notice. -->
+        <symbol id="icon-star-outline" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M11.48 3.499a.562.562 0 0 1 1.04 0l2.125 5.111a.563.563 0 0 0 .475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 0 0-.182.557l1.285 5.385a.562.562 0 0 1-.84.61l-4.725-2.885a.562.562 0 0 0-.586 0L6.982 20.54a.562.562 0 0 1-.84-.61l1.285-5.386a.562.562 0 0 0-.182-.557l-4.204-3.602a.562.562 0 0 1 .321-.988l5.518-.442a.563.563 0 0 0 .475-.345L11.48 3.5Z"/>
+        </symbol>
+
+        <!-- Star, filled (a favourite channel) -->
+        <symbol id="icon-star" viewBox="0 0 24 24">
+            <path fill="currentColor"
+                  d="M11.48 3.499a.562.562 0 0 1 1.04 0l2.125 5.111a.563.563 0 0 0 .475.345l5.518.442c.499.04.701.663.321.988l-4.204 3.602a.563.563 0 0 0-.182.557l1.285 5.385a.562.562 0 0 1-.84.61l-4.725-2.885a.562.562 0 0 0-.586 0L6.982 20.54a.562.562 0 0 1-.84-.61l1.285-5.386a.562.562 0 0 0-.182-.557l-4.204-3.602a.562.562 0 0 1 .321-.988l5.518-.442a.563.563 0 0 0 .475-.345L11.48 3.5Z"/>
+        </symbol>
+
+        <!-- Arrow leaving a doorway (leave channel) -->
+        <symbol id="icon-logout" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M15.75 9V5.25A2.25 2.25 0 0 0 13.5 3h-6a2.25 2.25 0 0 0-2.25 2.25v13.5A2.25 2.25 0 0 0 7.5 21h6a2.25 2.25 0 0 0 2.25-2.25V15m3 0 3-3m0 0-3-3m3 3H9"/>
+        </symbol>
+
+        <!-- Hash / pound (group conversation marker — visually distinct from #channel) -->
+        <symbol id="icon-group" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M5.25 8.25h15m-16.5 7.5h15m-1.875-15L13.5 21m-7.5-3.75L9 3"/>
+        </symbol>
+
+        <!-- Paper plane (send / DM) -->
+        <symbol id="icon-send" viewBox="0 0 24 24">
+            <path fill="currentColor" d="M2.5 20.5 22 12 2.5 3.5 2.5 10 16 12 2.5 14z"/>
+        </symbol>
+
+        <!-- ---- Message hover actions (see .msg-action) ---- -->
+
+        <!-- Arrow u-turn left (reply in thread) -->
+        <symbol id="icon-reply" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M9 15 3 9m0 0 6-6M3 9h12a6 6 0 0 1 0 12h-3"/>
+        </symbol>
+
+        <!-- Link (copy permalink) -->
+        <symbol id="icon-link" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M13.19 8.688a4.5 4.5 0 0 1 1.242 7.244l-4.5 4.5a4.5 4.5 0 0 1-6.364-6.364l1.757-1.757m13.35-.622 1.757-1.757a4.5 4.5 0 0 0-6.364-6.364l-4.5 4.5a4.5 4.5 0 0 0 1.242 7.244"/>
+        </symbol>
+
+        <!-- Pencil on a square (edit message) -->
+        <symbol id="icon-pencil" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m16.862 4.487 1.687-1.688a1.875 1.875 0 1 1 2.652 2.652L10.582 16.07a4.5 4.5 0 0 1-1.897 1.13L6 18l.8-2.685a4.5 4.5 0 0 1 1.13-1.897l8.932-8.931Zm0 0L19.5 7.125M18 14v4.75A2.25 2.25 0 0 1 15.75 21H5.25A2.25 2.25 0 0 1 3 18.75V8.25A2.25 2.25 0 0 1 5.25 6H10"/>
+        </symbol>
+
+        <!-- Trash (delete message) -->
+        <symbol id="icon-trash" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m14.74 9-.346 9m-4.788 0L9.26 9m9.968-3.21c.342.052.682.107 1.022.166m-1.022-.165L18.16 19.673a2.25 2.25 0 0 1-2.244 2.077H8.084a2.25 2.25 0 0 1-2.244-2.077L4.772 5.79m14.456 0a48.108 48.108 0 0 0-3.478-.397m-12 .562c.34-.059.68-.114 1.022-.165m0 0a48.11 48.11 0 0 1 3.478-.397m7.5 0v-.916c0-1.18-.91-2.164-2.09-2.201a51.964 51.964 0 0 0-3.32 0c-1.18.037-2.09 1.022-2.09 2.201v.916m7.5 0a48.667 48.667 0 0 0-7.5 0"/>
+        </symbol>
+
+        <!-- Lidded box (archive a channel) -->
+        <symbol id="icon-archive" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M20.25 7.5v11.25A2.25 2.25 0 0 1 18 21H6a2.25 2.25 0 0 1-2.25-2.25V7.5M2.25 4.5h19.5v3H2.25v-3ZM9.75 12h4.5"/>
+        </symbol>
+
+        <!-- Lidded box with an arrow coming out (unarchive) -->
+        <symbol id="icon-archive-restore" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M20.25 7.5v11.25A2.25 2.25 0 0 1 18 21H6a2.25 2.25 0 0 1-2.25-2.25V7.5M2.25 4.5h19.5v3H2.25v-3ZM12 17.25v-6m0 0-2.25 2.25M12 11.25l2.25 2.25"/>
+        </symbol>
+
+        <!-- Smiling face (add reaction — the picker itself still uses real emoji) -->
+        <symbol id="icon-face-smile" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M15.182 15.182a4.5 4.5 0 0 1-6.364 0M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0ZM9.75 9.75c0 .414-.168.75-.375.75S9 10.164 9 9.75 9.168 9 9.375 9s.375.336.375.75Zm-.375 0h.008v.015h-.008V9.75Zm5.625 0c0 .414-.168.75-.375.75s-.375-.336-.375-.75.168-.75.375-.75.375.336.375.75Zm-.375 0h.008v.015h-.008V9.75Z"/>
+        </symbol>
+
+        <!-- Chat bubble with ellipsis (thread indicator) -->
+        <symbol id="icon-thread" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M8.625 12a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H8.25m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0H12m4.125 0a.375.375 0 1 1-.75 0 .375.375 0 0 1 .75 0Zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 0 1-2.555-.337A5.972 5.972 0 0 1 5.41 20.97a5.969 5.969 0 0 1-.474-.065 4.48 4.48 0 0 0 .978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25Z"/>
+        </symbol>
+
+        <!-- Pushpin (pin a message to its channel). Drawn here rather than lifted from Heroicons,
+             which has no pushpin — only map-pin, which means "a place" and would read as a location
+             marker on a message. Same construction rules as the rest of the sheet (24×24, 1.5
+             stroke, round caps and joins) so it sits at the same weight beside them. -->
+        <symbol id="icon-play" viewBox="0 0 24 24">
+            <path fill="currentColor" d="M8 5.14v13.72a1 1 0 0 0 1.53.85l10.8-6.86a1 1 0 0 0 0-1.7L9.53 4.29A1 1 0 0 0 8 5.14Z"/>
+        </symbol>
+
+        <symbol id="icon-pin" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M8.25 3.75h7.5M10.5 3.75v6.75l-3 3.75h9l-3-3.75V3.75M12 14.25v6"/>
+        </symbol>
+
+        <!-- Arrow u-turn right (forward a message elsewhere). The mirror of #icon-reply, which is
+             exactly what a forward is next to a reply: the same gesture pointing the other way. -->
+        <symbol id="icon-forward" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m15 15 6-6m0 0-6-6m6 6H9a6 6 0 0 0 0 12h3"/>
+        </symbol>
+
+        <!-- Bookmark, outline (a message you have NOT saved). Paired with the filled variant below
+             for the same reason #icon-star-outline is paired with #icon-star: at 16px an
+             outline/filled pair is what makes a control read as a toggle, where a colour change
+             alone is too small a difference to notice. -->
+        <symbol id="icon-bookmark" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z"/>
+        </symbol>
+
+        <!-- Bookmark, filled (a saved message) -->
+        <symbol id="icon-bookmark-filled" viewBox="0 0 24 24">
+            <path fill="currentColor"
+                  d="M17.593 3.322c1.1.128 1.907 1.077 1.907 2.185V21L12 17.25 4.5 21V5.507c0-1.108.806-2.057 1.907-2.185a48.507 48.507 0 0 1 11.186 0Z"/>
+        </symbol>
+
+        <!-- Three dots (overflow — "more actions"). Circles rather than a stroked path, matching
+             #icon-list's bullets, so the dots are the same weight as that icon's at 16px. -->
+        <symbol id="icon-dots" viewBox="0 0 24 24">
+            <circle fill="currentColor" cx="5.5" cy="12" r="1.6"/>
+            <circle fill="currentColor" cx="12" cy="12" r="1.6"/>
+            <circle fill="currentColor" cx="18.5" cy="12" r="1.6"/>
+        </symbol>
+
+        <!-- Tick (the selected item in a single-choice menu — currently the presence-kind picker).
+             Heroicons' bare check rather than the circled variant: it marks a row that is already
+             carrying its own coloured dot, and a second enclosed shape beside that reads as a
+             control you can press. -->
+        <symbol id="icon-check" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M4.5 12.75l6 6 9-13.5"/>
+        </symbol>
+
+        <!-- Arrow out of a box (open in new tab) -->
+        <symbol id="icon-external" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M13.5 6H5.25A2.25 2.25 0 0 0 3 8.25v10.5A2.25 2.25 0 0 0 5.25 21h10.5A2.25 2.25 0 0 0 18 18.75V10.5m-10.5 6L21 3m0 0h-5.25M21 3v5.25"/>
+        </symbol>
+
+        <!-- ---- Composer formatting toolbar (see .composer-toolbar .tool) ----
+             Bold/italic/strike/code stay as letterforms (B, I, S, { }) — those are labels, not
+             icons, and every editor draws them that way. -->
+
+        <!-- Left rule with text lines (blockquote) -->
+        <symbol id="icon-quote" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M4 5.25v13.5M8.25 7.5h11.25M8.25 12h11.25M8.25 16.5h7.5"/>
+        </symbol>
+
+        <!-- Bulleted list -->
+        <symbol id="icon-list" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M8.25 6.75h12M8.25 12h12m-12 5.25h12"/>
+            <circle fill="currentColor" cx="4" cy="6.75" r="1.1"/>
+            <circle fill="currentColor" cx="4" cy="12" r="1.1"/>
+            <circle fill="currentColor" cx="4" cy="17.25" r="1.1"/>
+        </symbol>
+
+        <!-- Folder (a channel's shared files). Distinct from #icon-paperclip on purpose: the clip
+             means "a file is attached to this message", this means "the files of this place". -->
+        <symbol id="icon-folder" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M2.25 18.75V6.75A1.5 1.5 0 0 1 3.75 5.25h5.129a1.5 1.5 0 0 1 1.06.44l1.622 1.62a1.5 1.5 0 0 0 1.06.44h7.628a1.5 1.5 0 0 1 1.5 1.5v9.5a1.5 1.5 0 0 1-1.5 1.5H3.75a1.5 1.5 0 0 1-1.5-1.5Z"/>
+        </symbol>
+
+        <!-- Phone (start an audio call) -->
+        <symbol id="icon-phone" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M2.25 6.75c0 8.284 6.716 15 15 15h2.25a2.25 2.25 0 0 0 2.25-2.25v-1.372c0-.516-.351-.966-.852-1.091l-4.423-1.106c-.44-.11-.902.055-1.173.417l-.97 1.293c-.282.376-.769.542-1.21.38a12.035 12.035 0 0 1-7.143-7.143c-.162-.441.004-.928.38-1.21l1.293-.97c.363-.271.527-.734.417-1.173L6.963 3.102a1.125 1.125 0 0 0-1.091-.852H4.5A2.25 2.25 0 0 0 2.25 4.5v2.25Z"/>
+        </symbol>
+
+        <!-- Hang up. The same handset rotated, which is what every phone since 1990 has used for
+             this and therefore needs no learning — and it stays one path, so the two icons cannot
+             drift apart when the set is swapped. Red is applied by .call-btn-end, not here. -->
+        <symbol id="icon-phone-end" viewBox="0 0 24 24">
+            <g transform="rotate(135 12 12)">
+                <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                      d="M2.25 6.75c0 8.284 6.716 15 15 15h2.25a2.25 2.25 0 0 0 2.25-2.25v-1.372c0-.516-.351-.966-.852-1.091l-4.423-1.106c-.44-.11-.902.055-1.173.417l-.97 1.293c-.282.376-.769.542-1.21.38a12.035 12.035 0 0 1-7.143-7.143c-.162-.441.004-.928.38-1.21l1.293-.97c.363-.271.527-.734.417-1.173L6.963 3.102a1.125 1.125 0 0 0-1.091-.852H4.5A2.25 2.25 0 0 0 2.25 4.5v2.25Z"/>
+            </g>
+        </symbol>
+
+        <!-- Video camera (start a video call) -->
+        <symbol id="icon-video" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M4.5 18.75h9a2.25 2.25 0 0 0 2.25-2.25v-9a2.25 2.25 0 0 0-2.25-2.25h-9A2.25 2.25 0 0 0 2.25 7.5v9a2.25 2.25 0 0 0 2.25 2.25Z"/>
+        </symbol>
+
+        <!-- Video camera, struck through (camera off during a call) -->
+        <symbol id="icon-video-off" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m15.75 10.5 4.72-4.72a.75.75 0 0 1 1.28.53v11.38a.75.75 0 0 1-1.28.53l-4.72-4.72M12 18.75H4.5a2.25 2.25 0 0 1-2.25-2.25V9m12.841 9.091L16.5 19.5m-1.409-1.409c.407-.407.659-.97.659-1.591v-9a2.25 2.25 0 0 0-2.25-2.25h-9c-.621 0-1.184.252-1.591.659m12.182 12.182L2.909 5.909M1.5 4.5l1.409 1.409"/>
+        </symbol>
+
+        <!-- Microphone (live, unmuted) -->
+        <symbol id="icon-mic" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3Z"/>
+        </symbol>
+
+        <!-- Microphone, struck through (muted) -->
+        <!-- Browse channels: a compass, for "find your way around". -->
+        <symbol id="icon-compass" viewBox="0 0 24 24">
+            <circle fill="none" stroke="currentColor" stroke-width="1.5" cx="12" cy="12" r="9"/>
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="m15.5 8.5-2 5-5 2 2-5z"/>
+        </symbol>
+
+        <symbol id="icon-mic-off" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M12 18.75a6 6 0 0 0 6-6v-1.5m-6 7.5a6 6 0 0 1-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3 3 0 0 1-3-3V4.5a3 3 0 1 1 6 0v8.25a3 3 0 0 1-3 3ZM3 3l18 18"/>
+        </symbol>
+
+        <!-- P2P LAN file share (two-way transfer / local network signal) -->
+        <symbol id="icon-p2p" viewBox="0 0 24 24">
+            <path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"
+                  d="M7.5 21 3 16.5m0 0L7.5 12M3 16.5h13.5m0-13.5L21 7.5m0 0L16.5 12M21 7.5H7.5"/>
+        </symbol>
+
+    </defs>
+</svg>

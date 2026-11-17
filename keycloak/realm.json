@@ -1,0 +1,129 @@
+{
+  "realm": "tforge-realm",
+  "displayName": "ThreadForge",
+  "displayNameHtml": "<strong>Thread</strong>Forge",
+  "enabled": true,
+  "loginTheme": "threadforge",
+  "registrationAllowed": true,
+  "loginWithEmailAllowed": true,
+  "organizationsEnabled": true,
+  "ssoSessionIdleTimeout": 28800,
+  "ssoSessionMaxLifespan": 28800,
+  "ssoSessionIdleTimeoutRememberMe": 28800,
+  "ssoSessionMaxLifespanRememberMe": 28800,
+  "clients": [
+    {
+      "clientId": "tforge-client",
+      "enabled": true,
+      "rootUrl": "http://localhost:8080",
+      "baseUrl": "/",
+      "publicClient": false,
+      "secret": "DAJpMxDkLxHidawHQXu8MMlmjEiKQRZzWRiLzFBQ",
+      "redirectUris": [
+        "http://localhost:8080/*",
+        "http://127.0.0.1:8080/*"
+      ],
+      "webOrigins": [
+        "http://localhost:8080",
+        "http://127.0.0.1:8080"
+      ],
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": true,
+      "protocol": "openid-connect",
+      "attributes": {
+        "post.logout.redirect.uris": "+"
+      },
+      "protocolMappers": [
+        {
+          "name": "chat_max_upload_bytes",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-attribute-mapper",
+          "consentRequired": false,
+          "config": {
+            "user.attribute": "chat_max_upload_bytes",
+            "claim.name": "chat_max_upload_bytes",
+            "jsonType.label": "long",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        },
+        {
+          "name": "realm roles in id token",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-realm-role-mapper",
+          "consentRequired": false,
+          "config": {
+            "multivalued": "true",
+            "claim.name": "realm_access.roles",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "users": [
+    {
+      "id": "856199a6-37da-4ce5-82d7-9a3a3ea58359",
+      "username": "alice",
+      "enabled": true,
+      "email": "alice@example.com",
+      "firstName": "Alice",
+      "lastName": "Anderson",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "alice",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "tforge-user",
+        "tforge-admin"
+      ]
+    },
+    {
+      "id": "8a17163a-a71d-4d41-af39-19dd3794bd54",
+      "username": "bob",
+      "enabled": true,
+      "email": "bob@example.com",
+      "firstName": "Bob",
+      "lastName": "Brown",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "bob",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "tforge-user"
+      ]
+    }
+  ],
+  "roles": {
+    "realm": [
+      {
+        "name": "tforge-user"
+      },
+      {
+        "name": "admin"
+      },
+      {
+        "name": "tforge-admin",
+        "description": "Application admin (tforge-admin) — required to access /admin and platform-wide actions."
+      }
+    ]
+  },
+  "bruteForceProtected": true,
+  "permanentLockout": false,
+  "failureFactor": 10,
+  "waitIncrementSeconds": 60,
+  "maxFailureWaitSeconds": 900,
+  "maxDeltaTimeSeconds": 43200,
+  "quickLoginCheckMilliSeconds": 1000,
+  "minimumQuickLoginWaitSeconds": 60
+}

@@ -1,0 +1,227 @@
+<!--
+  Copyright 2026 ThreadForge
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<body>
+<!--/*
+  The left sidebar: channel filter, every channel you are in, the Browse channels button, the
+  first-login suggestions, the direct-message list, and the two creation popovers.
+
+  ONE COPY, ON PURPOSE. Both pages carried their own version and they had already drifted: the
+  conversation page was missing the channel search and the create-channel popover, and it used
+  different ids for the same two lists, so any script that looked one of them up worked on one page
+  and silently did nothing on the other.
+
+  No parameters. `sidebar`, `conversations`, `activeChannelId` and `activeConversationId` are all
+  on the model for every page that renders this — HomeController sets the inactive ones to null
+  explicitly rather than omitting them, so a highlight cannot depend on which page you are on.
+*/-->
+<th:block th:fragment="sidebar">
+<aside class="sidebar" id="app-sidebar">
+      <div class="sidebar-inner">
+        <div class="sidebar-search">
+            <span class="search-field">
+                <input type="search" id="sidebar-filter" placeholder="Filter or find channels…"
+                       autocomplete="off" aria-label="Filter your channels, or find new ones"/>
+                <button type="button" class="search-clear" tabindex="-1" hidden
+                        title="Clear search" aria-label="Clear search">
+                    <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-close"/></svg>
+                </button>
+            </span>
+            <!--/* Two jobs, one box, and the user has to be able to tell them apart. Typing
+                   narrows the list below (channels you are in, already on the page); it also asks
+                   the server for channels you are NOT in, which appear in the main content area.
+                   Without saying so, the second half looks like the first half misbehaving. */-->
+            <p class="sidebar-search-hint" id="sidebar-search-hint">
+                Filters your channels · finds new ones on the right
+            </p>
+        </div>
+
+        <!--/* Starred channels, at the top, as both Slack and Mattermost do. Hidden entirely when
+               nothing is starred rather than shown empty: a heading with nothing under it teaches
+               nobody what the star does, it just costs a row of vertical space. Users meet the
+               feature through the star on a channel row, which is where they can act on it. */-->
+        <div class="sidebar-section channel-group" th:if="${!sidebar.favourites.isEmpty()}">
+            <h2>Favourites</h2>
+            <ul class="channel-list"
+                th:replace="~{fragments/channel-group :: group(${sidebar.favourites}, ${activeChannelId}, ${sidebar.notifyDefault}, 'sidebar-favourite-list')}"></ul>
+        </div>
+
+        <!--/* Every channel you are in, alphabetically. Not a ranked shortlist: see SidebarView
+               for why "your five largest" and "your five most active" were worse than useless.
+               The list scrolls — .sidebar-inner is the scroll container. */-->
+        <div class="sidebar-section">
+            <h2>
+                Channels
+                <!--/* The create form hangs off this button as a popover rather than sitting in
+                       the sidebar flow: it's an occasional action, and inline it pushed the
+                       channel list down and competed with it for attention. */-->
+                <span class="popover-anchor">
+                    <button type="button" class="add-btn" id="sidebar-create-add-btn"
+                            title="Create channel" aria-label="Create channel"
+                            aria-haspopup="dialog" aria-expanded="false"
+                            aria-controls="sidebar-create-popover">
+                        <svg class="icon icon-sm"><use href="#icon-plus"/></svg>
+                    </button>
+                    <div class="sidebar-popover" id="sidebar-create-popover" role="dialog"
+                         aria-label="Create channel" hidden>
+                        <form id="create-channel-form-sidebar" class="create-channel-form">
+                            <label>Name <input name="name" required maxlength="120"/></label>
+                            <label>Description <input name="description" maxlength="500"/></label>
+                            <label>Type
+                                <select name="type">
+                                    <option value="PUBLIC">Public</option>
+                                    <option value="PRIVATE">Private</option>
+                                </select>
+                            </label>
+                            <button type="submit">Create</button>
+                        </form>
+                    </div>
+                </span>
+            </h2>
+            <ul class="channel-list" id="sidebar-channel-list"
+                th:replace="~{fragments/channel-group :: group(${sidebar.unstarred}, ${activeChannelId}, ${sidebar.notifyDefault}, 'sidebar-channel-list')}"></ul>
+            <p class="sidebar-empty" th:if="${sidebar.channels.isEmpty()}">
+                You're not in any channels yet — join one of the suggestions below, browse all of
+                them, or use + to create your own.
+            </p>
+            <!--/* Shown by chrome.js when the filter matches none of your channels. Without it the
+                   list just empties and the server results on the right look like the whole
+                   answer, which hides the fact that you are in nothing matching. */-->
+            <p class="sidebar-empty" id="sidebar-no-match" hidden>
+                None of your channels match — see the results on the right.
+            </p>
+            <!--/* The directory. A row at the foot of the list rather than a heading control, as
+                   Slack does, because it is the list's own "and everything else": the filter box
+                   above needs a name to find something, this needs nothing. Renders into the main
+                   content area (chrome.js), where a description and a member count have room. */-->
+            <button type="button" class="sidebar-browse-btn" id="sidebar-browse-btn">
+                <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-compass"/></svg>
+                Browse channels
+            </button>
+        </div>
+
+        <!--/* Suggested for you — rendered only for an account that is in no channel at all, which
+               SidebarService enforces by leaving the list empty otherwise. An empty column with a
+               filter box is a poor first minute, and a newcomer has no history to rank by, so the
+               five most populated public channels stand in for one: where everybody already is.
+               The ranking is never shown next to a list the viewer has begun to learn — the group
+               disappears with the first join — which is what keeps it clear of the reason ranked
+               shortlists were removed from this sidebar (see SidebarView).
+
+               The Join button sits beside the link, not inside it, for the same reason the star
+               does: nested, a click would also navigate. Wired by chrome.js (CSP: no inline
+               handlers); joining opens the channel. */-->
+        <div class="sidebar-section channel-group" id="sidebar-suggestions"
+             th:if="${!sidebar.suggestions.isEmpty()}">
+            <h2>Suggested for you</h2>
+            <ul class="channel-list suggestion-list" id="sidebar-suggestion-list">
+                <li th:each="s : ${sidebar.suggestions}"
+                    th:attr="data-name=${#strings.toLowerCase(s.name)},data-channel-id=${s.id}">
+                    <a th:href="@{'/channels/' + ${s.id}}" th:title="${s.description}">
+                        <span class="hash">#</span>
+                        <span class="channel-name" th:text="${s.name}">name</span>
+                        <span class="suggestion-members"
+                              th:title="${s.memberCount + (s.memberCount == 1 ? ' member' : ' members')}"
+                              th:text="${s.memberCount}">12</span>
+                    </a>
+                    <button type="button" class="suggestion-join"
+                            th:attr="data-join-channel=${s.id},aria-label=${'Join #' + s.name}">Join</button>
+                </li>
+            </ul>
+        </div>
+
+        <div class="sidebar-section">
+            <h2>
+                Direct messages
+                <!--/* Same popover treatment as create-channel above, and for the same reason:
+                       starting a conversation is occasional, and the form sitting in the sidebar
+                       flow pushed the list down and competed with it. */-->
+                <span class="popover-anchor">
+                    <button type="button" class="add-btn" id="sidebar-dm-btn"
+                            title="New message" aria-label="New message"
+                            aria-haspopup="dialog" aria-expanded="false"
+                            aria-controls="sidebar-dm-popover">
+                        <svg class="icon icon-sm"><use href="#icon-plus"/></svg>
+                    </button>
+                    <div class="sidebar-popover" id="sidebar-dm-popover" role="dialog"
+                         aria-label="New message" hidden>
+                        <form id="new-conversation-form" class="create-channel-form">
+                            <label>To
+                                <input name="members" required autocomplete="off"
+                                       placeholder="alice, bob"/>
+                            </label>
+                            <!--/* Browse-and-pick instead of knowing the exact handle — the same
+                                   dialog the channel settings' Find user uses, in pick mode:
+                                   choosing people fills the field above, and the form stays the
+                                   one thing that submits. Wired from
+                                   new-conversation-picker-boot.js (the CSP forbids inline
+                                   handlers). */-->
+                            <button type="button" id="new-conversation-find-btn"
+                                    class="find-user-trigger">
+                                <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-users"/></svg>
+                                Find user…
+                            </button>
+                            <label class="new-conversation-title" hidden>Group name
+                                <input name="title" maxlength="120"/>
+                            </label>
+                            <p class="form-hint" id="new-conversation-hint">
+                                One name starts a direct message. Add more to make a group.
+                            </p>
+                            <button type="submit" id="new-conversation-submit">Start</button>
+                        </form>
+                    </div>
+                </span>
+            </h2>
+            <ul class="dm-list" id="sidebar-dm-list">
+                <!--/* data-muted resolves the row's RAW level against the account default, in the
+                       same expression a channel row uses (see fragments/channel-group.html). The
+                       badge stays regardless: muting means "stop interrupting me", not "pretend
+                       nothing happened", so an unread count is still true in a muted DM. */-->
+                <li th:each="d : ${conversations}"
+                    th:with="active=${activeConversationId != null and activeConversationId == d.id},
+                             level=${d.notifyLevel.name() == 'DEFAULT' ? sidebar.notifyDefault.name() : d.notifyLevel.name()}"
+                    th:classappend="${d.unreadCount > 0 ? 'has-unread' : ''}"
+                    th:attr="data-active=${active},data-conv-id=${d.id},data-conv-type=${d.type.name()},data-unread=${d.unreadCount},data-notify-level=${d.notifyLevel},data-muted=${level == 'NONE'}">
+                    <a th:href="@{'/conversations/' + ${d.id}}"
+                       th:classappend="${active ? 'active' : ''}">
+                        <span class="avatar" th:data-author="${d.otherUsername ?: ''}">
+                            <img th:if="${d.otherHasAvatar}" class="avatar-image" alt=""
+                                 th:src="@{/api/users/{u}/avatar(u=${d.otherUsername},v=${d.otherAvatarVersion})}"/>
+                            <span class="avatar-letter"
+                                  th:text="${#strings.toUpperCase(#strings.substring(d.title, 0, 1))}">U</span>
+                        </span>
+                        <span class="dm-name" th:text="${d.title}">name</span>
+                        <svg th:if="${d.type.name() == 'GROUP'}" class="icon icon-sm dm-group-tag"
+                             title="Group conversation"><use href="#icon-group"/></svg>
+                        <svg th:if="${level == 'NONE'}" class="icon icon-sm dm-muted-tag"
+                             title="Muted — unread still counts, it just doesn't interrupt"><use href="#icon-bell-slash"/></svg>
+                        <span class="unread-badge"
+                              th:if="${d.unreadCount > 0}"
+                              th:text="${d.unreadCount > 99 ? '99+' : d.unreadCount}">3</span>
+                    </a>
+                </li>
+                <li th:if="${conversations == null or conversations.isEmpty()}" class="dm-empty">
+                    No direct messages yet — use + to start one.
+                </li>
+            </ul>
+
+        </div>
+      </div>
+    </aside>
+</th:block>
+</body>
+</html>

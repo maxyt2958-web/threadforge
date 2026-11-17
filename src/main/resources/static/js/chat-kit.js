@@ -1,0 +1,2466 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Shared composer / avatar / emoji helpers used by both chat.js (channels) and
+ * conversation.js (DMs). Loaded as a plain <script> so it must run before
+ * either page-script. Exposes everything on window.ChatKit; nothing is hoisted
+ * into the global scope directly.
+ */
+(function () {
+  if (window.ChatKit) return; // idempotent in case the script is loaded twice
+
+  // ---------- Avatar palette ----------
+  const hashCode = (str) => {
+    let h = 0;
+    for (let i = 0; i < str.length; i++) h = ((h << 5) - h) + str.charCodeAt(i) | 0;
+    return h;
+  };
+  const avatarColor = (username) => Math.abs(hashCode(username || '')) % 8;
+
+  /** Backfill data-color on every server-rendered .avatar[data-author] on the page. */
+  const backfillAvatarColors = (root = document) => {
+    root.querySelectorAll('.avatar[data-author]').forEach((el) => {
+      if (!el.dataset.color) el.dataset.color = String(avatarColor(el.dataset.author));
+    });
+  };
+
+  /**
+   * Build an avatar <span> with the standard structure (optional <img>, fallback
+   * letter). Used everywhere the chat creates avatars in JS-rendered DOM.
+   */
+  const buildAvatarEl = (opts) => {
+    const span = document.createElement('span');
+    span.className = 'avatar';
+    span.dataset.author = opts.username || '';
+    span.dataset.color = String(avatarColor(opts.username));
+    if (opts.hasAvatar && opts.username) {
+      const img = document.createElement('img');
+      img.className = 'avatar-image';
+      img.alt = '';
+      const v = opts.avatarVersion ? '?v=' + opts.avatarVersion : '';
+      img.src = '/api/users/' + encodeURIComponent(opts.username) + '/avatar' + v;
+      img.addEventListener('error', () => img.remove());
+      span.appendChild(img);
+    }
+    const letter = document.createElement('span');
+    letter.className = 'avatar-letter';
+    letter.textContent = opts.letter || '?';
+    span.appendChild(letter);
+    return span;
+  };
+
+  // ---------- Date / number formatters ----------
+  // Delegated to ChatTime (time-format.js), which resolves the viewer's zone, locale, clock and
+  // date order from the meta tags the server published — and, when the server only had an
+  // Accept-Language guess to go on, from what the browser itself reports. Formatting here with
+  // the browser's raw defaults is what used to put a 24-hour local time directly under the
+  // server's 12-hour UTC render of the message above it.
+  const dayKey = (d) => ChatTime.dayKey(d);
+  const formatTime = (d) => ChatTime.formatTime(d);
+  const formatBytes = (n) => {
+    if (n == null) return '';
+    const units = ['B', 'KB', 'MB', 'GB'];
+    let u = 0;
+    let v = n;
+    while (v >= 1024 && u < units.length - 1) { v /= 1024; u++; }
+    return (u === 0 ? v : v.toFixed(1)) + ' ' + units[u];
+  };
+
+  // ---------- Attachment upload with progress ----------
+  // fetch() has no upload-progress event, so a large file used to sit in the composer with no sign
+  // that anything was happening. XHR does, so the attachment uploaders on both pages go through
+  // this one function. It resolves with the bits of a Response the callers read (ok, status,
+  // statusText, json()), so their error handling is unchanged. onProgress gets (loaded, total).
+  // The returned promise carries abort(); an aborted upload rejects with an AbortError.
+  const uploadWithProgress = (url, file, headers, onProgress) => {
+    const xhr = new XMLHttpRequest();
+    const promise = new Promise((resolve, reject) => {
+      xhr.open('POST', url);
+      for (const [k, v] of Object.entries(headers || {})) xhr.setRequestHeader(k, v);
+      if (onProgress) {
+        xhr.upload.addEventListener('progress', (e) => {
+          onProgress(e.loaded, e.lengthComputable ? e.total : file.size);
+        });
+      }
+      xhr.addEventListener('load', () => {
+        const text = xhr.responseText;
+        resolve({
+          ok: xhr.status >= 200 && xhr.status < 300,
+          status: xhr.status,
+          statusText: xhr.statusText,
+          json: async () => JSON.parse(text),
+        });
+      });
+      xhr.addEventListener('error', () => reject(new Error('Network error')));
+      xhr.addEventListener('abort', () => reject(new DOMException('Upload cancelled', 'AbortError')));
+      xhr.send(file);
+    });
+    promise.abort = () => xhr.abort();
+    return promise;
+  };
+
+  /**
+   * One composer attachment chip: name, size, remove button, and a progress bar that shows once
+   * the upload starts. Shared by the channel composer (chips wait for Send) and the DM composer
+   * (chips appear while the upload runs). {@code onRemove} fires from the × button.
+   */
+  const buildUploadChip = (file, onRemove) => {
+    const chip = document.createElement('div');
+    chip.className = 'composer-chip';
+    chip.innerHTML = `<span class="composer-chip-name"></span>
+      <span class="composer-chip-size"></span>
+      <button type="button" class="composer-chip-remove" title="Remove" aria-label="Remove">
+        <svg class="icon icon-sm"><use href="#icon-close"/></svg>
+      </button>
+      <span class="composer-chip-progress" hidden><span class="composer-chip-progress-fill"></span></span>`;
+    chip.querySelector('.composer-chip-name').textContent = file.name;
+    const size = chip.querySelector('.composer-chip-size');
+    size.textContent = formatBytes(file.size);
+    const removeBtn = chip.querySelector('.composer-chip-remove');
+    removeBtn.addEventListener('click', () => onRemove?.());
+    const bar = chip.querySelector('.composer-chip-progress');
+    const fill = chip.querySelector('.composer-chip-progress-fill');
+    bar.setAttribute('role', 'progressbar');
+    bar.setAttribute('aria-label', 'Uploading ' + file.name);
+    bar.setAttribute('aria-valuemin', '0');
+    bar.setAttribute('aria-valuemax', '100');
+    const setProgress = (loaded, total) => {
+      const pct = total > 0 ? Math.min(100, Math.floor((loaded / total) * 100)) : 0;
+      chip.classList.add('is-uploading');
+      bar.hidden = false;
+      fill.style.width = pct + '%';
+      bar.setAttribute('aria-valuenow', String(pct));
+      size.textContent = pct >= 100 ? 'Processing…' : pct + '% of ' + formatBytes(total);
+      removeBtn.title = 'Cancel upload';
+      removeBtn.setAttribute('aria-label', 'Cancel upload');
+    };
+    const reset = () => {
+      chip.classList.remove('is-uploading');
+      bar.hidden = true;
+      fill.style.width = '0%';
+      size.textContent = formatBytes(file.size);
+      removeBtn.title = 'Remove';
+      removeBtn.setAttribute('aria-label', 'Remove');
+    };
+    return { chip, setProgress, reset };
+  };
+
+  // ---------- Drag-and-drop files onto the feed ----------
+  // Only drags carrying files count: a text selection dragged within the page, or dragged into
+  // the composer, keeps the browser's own behaviour.
+  const dragHasFiles = (e) => Array.from(e.dataTransfer?.types || []).includes('Files');
+
+  // Files from a drop, minus folders. A dropped folder arrives as a File with no type and a
+  // platform-dependent size, and uploading it fails with nothing useful to say about why.
+  const filesFromDrop = (dt) => {
+    const items = Array.from(dt.items || []).filter((it) => it.kind === 'file');
+    if (items.length && typeof items[0].webkitGetAsEntry === 'function') {
+      const folders = items.filter((it) => it.webkitGetAsEntry()?.isDirectory);
+      const files = items
+          .filter((it) => !folders.includes(it))
+          .map((it) => it.getAsFile())
+          .filter(Boolean);
+      return { files, skippedFolders: folders.length };
+    }
+    return { files: Array.from(dt.files || []), skippedFolders: 0 };
+  };
+
+  // How many files a drag carries. The items list is readable during dragenter (the files
+  // themselves are not, until the drop); some browsers leave it empty, hence the null.
+  const dragFileCount = (e) => {
+    const n = Array.from(e.dataTransfer?.items || []).filter((it) => it.kind === 'file').length;
+    return n > 0 ? n : null;
+  };
+  const plural = (n, word) => n + ' ' + word + (n === 1 ? '' : 's');
+
+  let dropGuardInstalled = false;
+
+  /**
+   * Accept files dropped anywhere on {@code zones} (the message history and the composer) and
+   * hand them to {@code onFiles}. While a file drag is over a zone, {@code overlayHost} carries
+   * the drop overlay. {@code verb} finishes its sentence ("Drop 3 files to <verb>") and
+   * {@code hint} is the smaller line under it, so the overlay says what will actually happen.
+   * {@code onFiles(files, skippedFolders)} gets the files with any folders taken out. A file
+   * dropped anywhere else on the page is swallowed rather than letting the browser navigate away
+   * to it, which throws the whole chat away.
+   */
+  const wireFileDrop = ({ zones, overlayHost, onFiles, verb = 'upload', hint = '' }) => {
+    const targets = (zones || []).filter(Boolean);
+    if (!targets.length || !onFiles) return;
+
+    if (!dropGuardInstalled) {
+      dropGuardInstalled = true;
+      window.addEventListener('dragover', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+      window.addEventListener('drop', (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+    }
+
+    let overlay = null;
+    if (overlayHost) {
+      overlay = document.createElement('div');
+      overlay.className = 'file-drop-overlay';
+      overlay.hidden = true;
+      overlay.innerHTML = `<div class="file-drop-overlay-inner">
+          <svg class="icon" aria-hidden="true"><use href="#icon-paperclip"/></svg>
+          <span class="file-drop-overlay-title"></span>
+          <span class="file-drop-overlay-hint"></span>
+        </div>`;
+      overlay.querySelector('.file-drop-overlay-hint').textContent = hint;
+      overlayHost.append(overlay);
+    }
+    const setTitle = (count) => {
+      if (!overlay) return;
+      overlay.querySelector('.file-drop-overlay-title').textContent =
+          'Drop ' + (count ? plural(count, 'file') : 'files') + ' to ' + verb;
+    };
+
+    // dragenter/dragleave fire for every child crossed, so a depth count across all zones is
+    // what tells "left the zone" apart from "moved onto a message inside it".
+    let depth = 0;
+    const show = (on) => { if (overlay) overlay.hidden = !on; };
+    for (const zone of targets) {
+      zone.addEventListener('dragenter', (e) => {
+        if (!dragHasFiles(e)) return;
+        e.preventDefault();
+        if (depth === 0) setTitle(dragFileCount(e));
+        depth++;
+        show(true);
+      });
+      zone.addEventListener('dragover', (e) => {
+        if (!dragHasFiles(e)) return;
+        e.preventDefault();
+        e.dataTransfer.dropEffect = 'copy';
+      });
+      zone.addEventListener('dragleave', (e) => {
+        if (!dragHasFiles(e)) return;
+        depth = Math.max(0, depth - 1);
+        if (depth === 0) show(false);
+      });
+      zone.addEventListener('drop', (e) => {
+        if (!dragHasFiles(e)) return;
+        e.preventDefault();
+        depth = 0;
+        show(false);
+        const { files, skippedFolders } = filesFromDrop(e.dataTransfer);
+        if (files.length || skippedFolders) onFiles(files, skippedFolders);
+      });
+    }
+    // A drag cancelled with Escape, or dropped outside the window, sends no dragleave to us.
+    window.addEventListener('dragend', () => { depth = 0; show(false); });
+    window.addEventListener('drop', () => { depth = 0; show(false); });
+  };
+
+  /**
+   * The one-line status at the top of the composer's attachment tray: what the chips are waiting
+   * for, or how far through the batch the uploads are. Empty text removes it. {@code tone}
+   * 'warn' is for things the user should notice but that stopped nothing (a skipped folder).
+   */
+  const setUploadStatus = (tray, text, tone) => {
+    if (!tray) return;
+    let line = tray.querySelector('.composer-upload-status');
+    if (!text) { line?.remove(); return; }
+    if (!line) {
+      line = document.createElement('div');
+      line.className = 'composer-upload-status';
+      line.setAttribute('role', 'status');
+      line.setAttribute('aria-live', 'polite');
+      tray.prepend(line);
+    }
+    line.textContent = text;
+    line.classList.toggle('is-warn', tone === 'warn');
+    tray.hidden = false;
+  };
+  const skippedFoldersText = (n) =>
+      n ? 'Skipped ' + plural(n, 'folder') + ' — only files can be uploaded. ' : '';
+
+  // ---------- Composer textarea: caret insert + auto-resize ----------
+  const insertAtCursor = (ta, text) => {
+    if (!ta) return;
+    const start = ta.selectionStart ?? ta.value.length;
+    const end = ta.selectionEnd ?? ta.value.length;
+    ta.value = ta.value.slice(0, start) + text + ta.value.slice(end);
+    const caret = start + text.length;
+    ta.selectionStart = ta.selectionEnd = caret;
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+
+  /**
+   * Slack/Mattermost-style auto-grow: textarea expands from its CSS min-height up
+   * to {@code maxPx}, then scrolls. Resetting height to 'auto' before reading
+   * scrollHeight avoids the runaway-growth bug after deletes.
+   *
+   * <p>One scrollHeight read, not two. Reading it forces the browser to lay the page out then and
+   * there, and this runs on every keystroke in every composer — the most frequently executed DOM
+   * code in the application. The second read used to decide overflowY, but it was asking a question
+   * the first read already answers: the height written is min(natural, maxPx), so the box scrolls
+   * exactly when the natural height exceeded the cap.
+   */
+  const wireAutoResize = (ta, maxPx = 260) => {
+    if (!ta) return;
+    const resize = () => {
+      ta.style.height = 'auto';
+      const natural = ta.scrollHeight;
+      ta.style.height = Math.min(natural, maxPx) + 'px';
+      ta.style.overflowY = natural > maxPx ? 'auto' : 'hidden';
+    };
+    ta.addEventListener('input', resize);
+    resize();
+    // Once more after the first frame: fonts and the sidebar settle after this runs, and a composer
+    // that starts with text in it measures short until they do. Once per composer, not per keystroke.
+    requestAnimationFrame(resize);
+    ta._autoResize = resize;
+  };
+
+  // ---------- Markdown formatting toolbar ----------
+  const wrapSelection = (ta, before, after, placeholder) => {
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    const sel = ta.value.slice(start, end);
+    const text = sel || (placeholder || '');
+    ta.value = ta.value.slice(0, start) + before + text + after + ta.value.slice(end);
+    ta.selectionStart = start + before.length;
+    ta.selectionEnd = start + before.length + text.length;
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+
+  const prefixLines = (ta, prefix) => {
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    const lineStart = ta.value.lastIndexOf('\n', start - 1) + 1;
+    const nextNl = ta.value.indexOf('\n', end);
+    const lineEnd = nextNl === -1 ? ta.value.length : nextNl;
+    const block = ta.value.slice(lineStart, lineEnd);
+    const transformed = (block || '').split('\n').map((l) => prefix + l).join('\n');
+    ta.value = ta.value.slice(0, lineStart) + transformed + ta.value.slice(lineEnd);
+    ta.selectionStart = lineStart;
+    ta.selectionEnd = lineStart + transformed.length;
+    ta.focus();
+    ta.dispatchEvent(new Event('input', { bubbles: true }));
+  };
+
+  const applyFormat = (ta, kind) => {
+    if (!ta) return;
+    const start = ta.selectionStart, end = ta.selectionEnd;
+    const sel = ta.value.slice(start, end);
+    switch (kind) {
+      case 'bold':   return wrapSelection(ta, '**', '**', 'bold');
+      case 'italic': return wrapSelection(ta, '_',  '_',  'italic');
+      case 'strike': return wrapSelection(ta, '~~', '~~', 'strikethrough');
+      case 'link': {
+        const text = sel || 'text';
+        const before = '[' + text + '](';
+        const url = 'https://';
+        ta.value = ta.value.slice(0, start) + before + url + ')' + ta.value.slice(end);
+        ta.selectionStart = start + before.length;
+        ta.selectionEnd   = start + before.length + url.length;
+        ta.focus();
+        ta.dispatchEvent(new Event('input', { bubbles: true }));
+        return;
+      }
+      case 'code':
+        if (sel.includes('\n')) return wrapSelection(ta, '```\n', '\n```', 'code');
+        return wrapSelection(ta, '`', '`', 'code');
+      case 'quote': return prefixLines(ta, '> ');
+      case 'list':  return prefixLines(ta, '- ');
+      default: return;
+    }
+  };
+
+  const wireFormatToolbar = (toolbar) => {
+    if (!toolbar) return;
+    const targetId = toolbar.dataset.formatTarget;
+    const ta = targetId ? document.getElementById(targetId) : null;
+    if (!ta) return;
+    let pendingSelection = null;
+    toolbar.addEventListener('mousedown', (e) => {
+      const btn = e.target.closest('button[data-format]');
+      if (!btn) return;
+      e.preventDefault(); // keep textarea focused, don't take it for the button
+      pendingSelection = { start: ta.selectionStart, end: ta.selectionEnd };
+    });
+    toolbar.addEventListener('click', (e) => {
+      const btn = e.target.closest('button[data-format]');
+      if (!btn) return;
+      e.preventDefault();
+      if (pendingSelection) {
+        ta.focus();
+        ta.selectionStart = pendingSelection.start;
+        ta.selectionEnd = pendingSelection.end;
+        pendingSelection = null;
+      }
+      applyFormat(ta, btn.dataset.format);
+    });
+    ta.addEventListener('keydown', (e) => {
+      if (!(e.ctrlKey || e.metaKey) || e.shiftKey || e.altKey) return;
+      const map = { b: 'bold', i: 'italic', k: 'link', e: 'code' };
+      const f = map[e.key.toLowerCase()];
+      if (f) { e.preventDefault(); applyFormat(ta, f); }
+    });
+    // Every composer textarea has exactly one toolbar pointing at it, so this is the
+    // single wiring point that gives the channel, DM and both thread composers the
+    // rich-paste conversion — no page script has to remember it.
+    wirePasteMarkdown(ta);
+  };
+
+  /** Wire every toolbar with data-format-target on the page. Idempotent — call once at startup. */
+  const wireAllFormatToolbars = (root = document) => {
+    root.querySelectorAll('.composer-toolbar[data-format-target]').forEach(wireFormatToolbar);
+  };
+
+  // ---------- CSRF ----------
+  /**
+   * Standard JSON headers plus the CSRF token from the page metas. Browser /api/** calls
+   * ride the session-cookie web chain, so this header is what authorises a POST.
+   */
+  const csrfHeaders = () => {
+    const token = document.querySelector('meta[name="_csrf"]')?.content;
+    const header = document.querySelector('meta[name="_csrf_header"]')?.content;
+    const h = { 'Content-Type': 'application/json', 'Accept': 'application/json' };
+    if (token && header) h[header] = token;
+    return h;
+  };
+
+  // ---------- Paste rich text as Markdown ----------
+  /*
+   * Any app that copies rich text — Google Docs, Apple Notes, Word — puts a text/html
+   * flavor on the clipboard beside text/plain. The paste handler sends that HTML to
+   * POST /api/paste/markdown and inserts the returned Markdown; on convert:false, a
+   * non-ok response, a timeout or any error it inserts the plain flavor it captured up
+   * front, so a paste can be delayed by up to the 2s timeout but never lost.
+   * Ctrl+Shift+V (paste without formatting) ships no text/html and bypasses all of this
+   * natively; Ctrl+Z after a converted paste takes the whole paste back out.
+   */
+
+  /**
+   * Cheap pre-guard so the everyday "copied plain text off a page" paste — which still
+   * carries a bare-div text/html flavor — skips the round trip. Deliberately
+   * over-inclusive: the server's signal test is the authoritative answer.
+   */
+  const PASTE_RICH_HINT = /<(b|strong|em|i|s|del|h[1-6]|li|table|blockquote|pre|code|a)\b|font-weight|font-style:\s*(italic|oblique)|line-through|mso-list|docs-internal-guid/i;
+  const pasteWorthConverting = (html) =>
+      !!html && html.length <= 524288 && PASTE_RICH_HINT.test(html);
+
+  /** Transient banner above the composer that owns {@code ta}; reuses .composer-notice styling. */
+  const showPasteNotice = (ta, text) => {
+    const form = ta.closest('form') || ta.parentElement;
+    if (!form || !form.parentNode) return;
+    let notice = form.previousElementSibling;
+    if (!notice || !notice.classList.contains('composer-paste-notice')) {
+      notice = document.createElement('div');
+      notice.className = 'composer-notice composer-paste-notice';
+      notice.setAttribute('role', 'status');
+      form.parentNode.insertBefore(notice, form);
+    }
+    notice.textContent = text;
+    notice.hidden = false;
+    clearTimeout(notice._hideTimer);
+    notice._hideTimer = setTimeout(() => { notice.hidden = true; }, 4000);
+  };
+
+  /**
+   * Insert pasted text at the caret. execCommand is deprecated but universally
+   * implemented for textarea insertText, and it is the only insertion that keeps the
+   * native undo stack — which is the whole escape hatch for an unwanted conversion.
+   * insertAtCursor is the fallback where it reports failure: no undo, but never lost
+   * text. The pre-clamp to the remaining room matters because engines disagree on
+   * whether maxlength binds a scripted insert (Chrome truncates inside execCommand,
+   * others don't); clamping first makes them agree, and the hard slice after is only
+   * for a corner where one still overshoots.
+   */
+  const insertPasteText = (ta, text) => {
+    if (!text) return;
+    const max = Number(ta.getAttribute('maxlength')) || 8000;
+    const selection = (ta.selectionEnd ?? 0) - (ta.selectionStart ?? 0);
+    const room = max - (ta.value.length - selection);
+    if (room <= 0) {
+      showPasteNotice(ta, 'The message is already at the ' + max.toLocaleString() + '-character limit.');
+      return;
+    }
+    let clipped = text;
+    if (clipped.length > room) {
+      clipped = clipped.slice(0, room);
+      const tail = clipped.charCodeAt(clipped.length - 1);
+      if (tail >= 0xD800 && tail <= 0xDBFF) clipped = clipped.slice(0, -1); // don't split a surrogate pair
+      showPasteNotice(ta, 'Pasted text was shortened to fit the ' + max.toLocaleString() + '-character limit.');
+    }
+    if (document.activeElement !== ta) ta.focus();
+    let inserted = false;
+    try { inserted = document.execCommand('insertText', false, clipped); } catch (_) { inserted = false; }
+    if (!inserted) insertAtCursor(ta, clipped);
+    if (ta.value.length > max) {
+      ta.value = ta.value.slice(0, max);
+      ta.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  };
+
+  /** Convert rich pastes to Markdown. Wired once per composer by wireFormatToolbar. */
+  const wirePasteMarkdown = (ta) => {
+    if (!ta || ta.dataset.pasteWired) return;
+    ta.dataset.pasteWired = '1';
+    ta.addEventListener('paste', (e) => {
+      const dt = e.clipboardData;
+      if (!dt) return;
+      // Both flavors must be read before anything async — clipboardData is only
+      // readable synchronously inside the event dispatch.
+      const html = dt.getData('text/html');
+      const plain = dt.getData('text/plain');
+      if (!html || !plain || !pasteWorthConverting(html)) return; // native paste
+      // A second paste while one is in flight stays native: it lands as plain text now
+      // rather than being dropped — degraded beats lost.
+      if (ta._pastePending) return;
+      e.preventDefault();
+      ta._pastePending = true;
+      const finish = (insertText) => {
+        ta._pastePending = false;
+        insertPasteText(ta, insertText);
+      };
+      const signal = (typeof AbortSignal !== 'undefined' && AbortSignal.timeout)
+          ? AbortSignal.timeout(2000) : undefined;
+      fetch('/api/paste/markdown', {
+        method: 'POST',
+        headers: csrfHeaders(),
+        body: JSON.stringify({ html }),
+        signal,
+      })
+        .then((res) => (res.ok ? res.json() : null))
+        .then((data) => finish(data && data.convert && data.markdown ? data.markdown : plain))
+        .catch(() => finish(plain));
+    });
+  };
+
+  // ---------- Paste files (screenshots, copied files) as attachments ----------
+  /*
+   * A paste is treated as files only when the clipboard carries no real text. Word, Excel and
+   * Google Sheets put a picture of the selection on the clipboard *beside* the text, and that paste
+   * belongs to wirePasteMarkdown above, never here: uploading a PNG of a table someone meant to
+   * paste as text would be the worst possible reading of it. What counts as "no real text" is
+   * empty text/plain, or text/plain that is just the copied files' own names (what a file copied
+   * in a file manager carries).
+   */
+  const pastedFiles = (dt) => {
+    const files = Array.from(dt?.files || []);
+    if (!files.length) return [];
+    const plain = (dt.getData('text/plain') || '').trim();
+    if (plain) {
+      const names = new Set(files.map((f) => f.name));
+      if (!plain.split(/\r?\n/).every((line) => names.has(line.trim()))) return [];
+    }
+    return files.map(namePastedFile);
+  };
+
+  // A screenshot comes off the clipboard as "image.png" every time, so three of them in a channel
+  // are three files nobody can tell apart. Give a generic name the time it was pasted.
+  const GENERIC_PASTE_NAME = /^image\.(png|jpe?g|gif|webp|bmp|tiff?)$/i;
+  const namePastedFile = (f) => {
+    const m = GENERIC_PASTE_NAME.exec(f.name || '');
+    if (!m && f.name) return f;
+    const d = new Date();
+    const p = (n) => String(n).padStart(2, '0');
+    const stamp = d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate())
+        + ' ' + p(d.getHours()) + '.' + p(d.getMinutes()) + '.' + p(d.getSeconds());
+    const ext = m ? m[1].toLowerCase() : ((f.type || '').split('/')[1] || 'bin');
+    return new File([f], 'Pasted image ' + stamp + '.' + ext,
+        { type: f.type, lastModified: f.lastModified });
+  };
+
+  /** Hand files pasted into {@code ta} to {@code onFiles}; text pastes are left alone. */
+  const wirePasteFiles = (ta, onFiles) => {
+    if (!ta || !onFiles || ta.dataset.pasteFilesWired) return;
+    ta.dataset.pasteFilesWired = '1';
+    ta.addEventListener('paste', (e) => {
+      if (e.defaultPrevented) return; // the rich-text converter already took it
+      const files = pastedFiles(e.clipboardData);
+      if (!files.length) return;
+      e.preventDefault();
+      onFiles(files);
+    });
+  };
+
+  // ---------- Syntax highlighting ----------
+  /**
+   * Run highlight.js over every {@code pre code} under {@code root}. Shared by the channel page,
+   * the DM page, and both of their thread panels / live previews, so a message rendered anywhere
+   * gets the same treatment — see the module doc for why a second implementation here is a bug
+   * waiting, not a shortcut. Pages that don't load {@code vendor/highlight.min.js} (a fenced code
+   * block is content, not chrome — nothing breaks by skipping it) get a one-time console warning
+   * instead of a hard dependency.
+   */
+  const highlightCode = (root) => {
+    if (!root) return;
+    // Mermaid sources are not code to colour; renderDiagrams turns them into pictures, and
+    // highlight.js has no grammar for them (it would only log that it doesn't).
+    const blocks = root.querySelectorAll('pre code:not(.language-mermaid)');
+    // Nothing to do is not a problem worth a warning: chat-kit runs on pages that carry no code
+    // at all (/files, the file manager), and warning there trains people to ignore the line that
+    // matters — a page that has code blocks and no highlighter.
+    if (!blocks.length) return;
+    if (!window.hljs) {
+      if (!highlightCode._warned) {
+        highlightCode._warned = true;
+        console.warn('[hljs] highlight.js not loaded — code blocks will render unhighlighted');
+      }
+      return;
+    }
+    blocks.forEach((block) => {
+      // hljs v11 marks processed blocks with data-highlighted="yes"; re-running just spams a warning.
+      if (block.dataset.highlighted === 'yes') return;
+      try {
+        window.hljs.highlightElement(block);
+      } catch (err) {
+        console.warn('[hljs] failed to highlight a block:', err);
+      }
+    });
+  };
+
+  // ---------- Mermaid diagrams ----------
+  /*
+   * A ```mermaid fence draws as a diagram, the way GitHub draws one in a README. The server does
+   * nothing new: CommonMark already turns the fence into <pre><code class="language-mermaid">, and
+   * the safelist already keeps that class. The browser swaps the block for an SVG.
+   *
+   * - Mermaid is 5 MB, so it is fetched only when a page actually has a diagram, and with a
+   *   ?v= URL so StaticAssetCacheConfig serves it immutable — a second page view costs nothing.
+   *   Bump MERMAID_VERSION with the vendored file or every browser keeps the old one.
+   * - securityLevel 'strict' is what makes drawing someone else's text safe: labels are run
+   *   through Mermaid's DOMPurify, HTML in them is escaped, and click/callback directives are
+   *   ignored. Never loosen it — the source is whatever any channel member typed.
+   * - The source is kept, hidden, behind a "Source" toggle: it is what the author wrote, and what
+   *   a reader copies to edit the diagram.
+   * - A diagram that fails to parse stays a code block with a one-line reason under it, rather
+   *   than Mermaid's own bomb graphic (suppressErrorRendering).
+   */
+  const MERMAID_VERSION = '12.2.0';
+  const MERMAID_MAX_SOURCE = 20000;
+  let mermaidLoading = null;
+  let mermaidSeq = 0;
+
+  const loadMermaid = () => {
+    if (window.mermaid) return Promise.resolve(window.mermaid);
+    if (mermaidLoading) return mermaidLoading;
+    mermaidLoading = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = '/js/vendor/mermaid.min.js?v=' + MERMAID_VERSION;
+      script.async = true;
+      script.onload = () => {
+        if (!window.mermaid) { reject(new Error('Mermaid did not load')); return; }
+        window.mermaid.initialize({
+          startOnLoad: false,
+          securityLevel: 'strict',
+          suppressErrorRendering: true,
+          theme: window.ChatTheme?.isDark?.() ? 'dark' : 'default',
+          fontFamily: 'Figtree, system-ui, sans-serif',
+        });
+        resolve(window.mermaid);
+      };
+      script.onerror = () => {
+        mermaidLoading = null; // let a later message try again
+        reject(new Error('Mermaid failed to load'));
+      };
+      document.head.append(script);
+    });
+    return mermaidLoading;
+  };
+
+  // A diagram arrives after the message it sits in, and has a height nobody knew in advance. If
+  // the feed was parked at the bottom, keep it there; otherwise leave the reader where they are.
+  const scrollParentOf = (el) => {
+    for (let p = el.parentElement; p; p = p.parentElement) {
+      const oy = getComputedStyle(p).overflowY;
+      if ((oy === 'auto' || oy === 'scroll') && p.scrollHeight > p.clientHeight) return p;
+    }
+    return null;
+  };
+  const keepBottomPinned = (el, change) => {
+    const scroller = scrollParentOf(el);
+    const pinned = scroller
+        && scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+    change();
+    if (pinned) scroller.scrollTop = scroller.scrollHeight;
+  };
+
+  const showDiagramError = (pre, err) => {
+    const note = document.createElement('div');
+    note.className = 'mermaid-error';
+    const reason = String(err?.message || err || '').split('\n')[0].slice(0, 200);
+    note.textContent = "Couldn't draw this diagram" + (reason ? ': ' + reason : '.');
+    pre.after(note);
+  };
+
+  const drawDiagram = async (mermaid, pre, source) => {
+    const id = 'mermaid-' + (++mermaidSeq);
+    try {
+      const { svg } = await mermaid.render(id, source);
+      const figure = document.createElement('div');
+      figure.className = 'mermaid-diagram';
+      figure.innerHTML = `<div class="mermaid-diagram-canvas"></div>
+        <button type="button" class="mermaid-diagram-toggle" aria-pressed="false">Source</button>`;
+      // Mermaid's own output, built under securityLevel 'strict' and passed through its DOMPurify.
+      figure.querySelector('.mermaid-diagram-canvas').innerHTML = svg;
+      const toggle = figure.querySelector('.mermaid-diagram-toggle');
+      toggle.addEventListener('click', () => {
+        const showSource = pre.hidden;
+        pre.hidden = !showSource;
+        figure.querySelector('.mermaid-diagram-canvas').hidden = showSource;
+        toggle.textContent = showSource ? 'Diagram' : 'Source';
+        toggle.setAttribute('aria-pressed', String(showSource));
+      });
+      keepBottomPinned(pre, () => {
+        pre.before(figure);
+        pre.hidden = true;
+        figure.append(pre); // the toggle swaps between the two inside one box
+      });
+    } catch (err) {
+      // render() can leave its scratch element behind on a parse failure.
+      document.getElementById('d' + id)?.remove();
+      keepBottomPinned(pre, () => showDiagramError(pre, err));
+    }
+  };
+
+  const renderDiagrams = (root) => {
+    if (!root) return;
+    const blocks = Array.from(root.querySelectorAll('pre > code.language-mermaid'))
+        .filter((code) => !code.dataset.diagram);
+    if (!blocks.length) return;
+    for (const code of blocks) code.dataset.diagram = 'pending';
+    loadMermaid().then(async (mermaid) => {
+      // One at a time, in document order: render() measures text in a scratch element, and the
+      // diagrams in a long history land top to bottom rather than in whatever order they finish.
+      for (const code of blocks) {
+        const pre = code.parentElement;
+        if (!pre.isConnected) continue; // re-rendered (an edit) before we got to it
+        const source = code.textContent || '';
+        code.dataset.diagram = 'done';
+        if (!source.trim()) continue;
+        if (source.length > MERMAID_MAX_SOURCE) {
+          showDiagramError(pre, 'it is longer than ' + MERMAID_MAX_SOURCE.toLocaleString() + ' characters');
+          continue;
+        }
+        await drawDiagram(mermaid, pre, source);
+      }
+    }).catch((err) => {
+      console.warn('[mermaid]', err);
+      for (const code of blocks) code.dataset.diagram = 'failed';
+    });
+  };
+
+  // ---------- Rendered message bodies ----------
+  /*
+   * The one way a server-rendered message body reaches the DOM.
+   *
+   * Every feed, panel and list that shows a message does the same two things: drop the server's
+   * sanitized bodyHtml in, then highlight the fenced code in it. That was eight copies of the
+   * pair — the channel feed, its edit re-render, its thread replies and pins panel, the DM feed
+   * and its two re-renders, and /saved — and four of them had the second line while four did not.
+   * The result was a code block that rendered coloured in the channel feed and plain in the DM
+   * history, the pins panel and saved items, with nothing thrown and nothing logged. Route a new
+   * body renderer through here and the step it would have forgotten is not optional any more.
+   *
+   * A body that is *typed* rather than rendered (the optimistic bubble's escaped text) has no
+   * markup to highlight and does not need this, but costs nothing by using it.
+   */
+  const renderMessageBody = (el, html) => {
+    if (!el) return el;
+    // innerHTML, deliberately, and NOT Element.setHTML(). A body is sanitized server-side
+    // (CommonMark → jsoup Safelist → MarkdownRenderer's own additions) and then deliberately
+    // given back two things the browser's sanitizer destroys:
+    //   - the <iframe> of a YouTube/Vimeo embed, which MarkdownRenderer.embedVideos injects
+    //     *after* the safelist pass. setHTML removes iframes unconditionally — a custom
+    //     SanitizerConfig cannot allow them back — so every video embed in the app would
+    //     silently disappear.
+    //   - data-* attributes, which the default sanitizer strips: data-username / data-mention
+    //     on a rendered mention, and data-orientation on the embed wrapper, which app.css reads
+    //     to give a Short its 9:16 frame.
+    // The escaped snippets in search-box.js are the opposite case and do use setHTML; see there.
+    el.innerHTML = html || '';
+    highlightCode(el);
+    renderDiagrams(el);
+    return el;
+  };
+
+  /** {@link renderMessageBody} into a fresh {@code div.message-body}, plus any page-specific class. */
+  const buildMessageBodyEl = (html, extraClass) => {
+    const el = document.createElement('div');
+    el.className = extraClass ? 'message-body ' + extraClass : 'message-body';
+    return renderMessageBody(el, html);
+  };
+
+  /*
+   * The other half: the history Thymeleaf drew before any of this ran. Every page that renders
+   * messages server-side needs it, so it happens here once instead of being a line each page's
+   * own script has to remember — which is exactly the line the DM page didn't have, leaving a
+   * refreshed conversation's code blocks plain until something edited them.
+   */
+  const highlightServerRendered = () => {
+    highlightCode(document);
+    renderDiagrams(document);
+  };
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', highlightServerRendered, { once: true });
+  } else {
+    highlightServerRendered();
+  }
+
+  // ---------- Markdown live preview ----------
+  /**
+   * Wire {@code textarea} to a paired preview pane. The pane is the container that
+   * shows/hides with the rendered output; {@code body} is the inner div we render into.
+   * Server-rendered preview ({@code POST /api/preview}) so the result is identical to the
+   * posted message — including its highlighting, since it goes through
+   * {@link renderMessageBody} like every other body. Also supplies a hook to reset on submit.
+   */
+  const wireLivePreview = ({ textarea, pane, body, form, headers }) => {
+    if (!textarea || !pane || !body) return;
+    let debounce = null;
+    let req = 0;
+    const refresh = async () => {
+      const text = textarea.value;
+      if (!text.trim()) {
+        pane.hidden = true;
+        body.innerHTML = '';
+        return;
+      }
+      const myReq = ++req;
+      try {
+        const res = await fetch('/api/preview', {
+          method: 'POST',
+          headers: typeof headers === 'function' ? headers() : (headers || { 'Content-Type': 'application/json' }),
+          body: JSON.stringify({ body: text }),
+        });
+        if (!res.ok) return;
+        const data = await res.json();
+        if (myReq !== req) return; // stale
+        renderMessageBody(body, data.html);
+        pane.hidden = !data.html;
+      } catch (_) { /* leave previous render */ }
+    };
+    textarea.addEventListener('input', () => {
+      clearTimeout(debounce);
+      debounce = setTimeout(refresh, 220);
+    });
+    if (form) {
+      form.addEventListener('submit', () => {
+        clearTimeout(debounce);
+        pane.hidden = true;
+        body.innerHTML = '';
+      });
+    }
+    return { refresh };
+  };
+
+  // ---------- Emoji picker ----------
+  const REACTION_PICKER_EMOJI = ['👍','👎','❤️','😂','🎉','🚀','👀','🙏','🔥','💯','✅','❌'];
+  let emojiPickerEl = null;
+
+  /*
+   * Recently used emoji.
+   *
+   * The picker opens on "Smileys & Emotion" — four hundred faces, of which almost nobody uses more
+   * than a couple of dozen, and the ones they do use are scattered across eight categories. Putting
+   * the last two dozen at the top turns the common case from a search or a scroll into a click.
+   *
+   * localStorage, so per device and per browser profile, like the notification sound switches and
+   * for a similar reason: this is a scratch list that changes several times a session, and paying a
+   * request per emoji to keep it on the account would cost more than it is worth. The trade is that
+   * it does not follow you between machines — acceptable for a shortcut whose absence just gives
+   * you the picker as it was.
+   *
+   * Stored as characters only, not as objects: names and keywords come from EMOJI_DATA at render
+   * time, so a dataset edit fixes an old entry's tooltip rather than leaving it frozen in storage.
+   */
+  const RECENT_EMOJI_KEY = 'tforge.emoji.recent';
+  const RECENT_EMOJI_MAX = 24;
+
+  const readRecentEmoji = () => {
+    try {
+      const raw = JSON.parse(localStorage.getItem(RECENT_EMOJI_KEY) || '[]');
+      return Array.isArray(raw) ? raw.filter((c) => typeof c === 'string' && c) : [];
+    } catch (unavailableOrCorrupt) {
+      // Private mode, disabled storage, or somebody's hand-edited JSON. A missing shortcut is not
+      // worth an exception on the way to opening a picker.
+      return [];
+    }
+  };
+
+  /** Move {@code char} to the front of the recents, capped. Most recent first. */
+  const rememberEmoji = (char) => {
+    if (!char) return;
+    try {
+      const next = [char, ...readRecentEmoji().filter((c) => c !== char)].slice(0, RECENT_EMOJI_MAX);
+      localStorage.setItem(RECENT_EMOJI_KEY, JSON.stringify(next));
+    } catch (unavailable) {
+      // Same as above: the picker still works, it just will not remember.
+    }
+  };
+
+  /** Character → dataset entry, built once, so a recent emoji keeps its name and tooltip. */
+  let emojiByChar = null;
+  const emojiEntry = (char) => {
+    if (!emojiByChar) {
+      emojiByChar = new Map();
+      for (const g of (window.EMOJI_DATA?.groups || [])) {
+        for (const e of g.emojis) emojiByChar.set(e.c, e);
+      }
+    }
+    // An emoji that has since been removed from the dataset still renders — it is in the list
+    // because the user picked it, and dropping it would look like the list losing entries at random.
+    return emojiByChar.get(char) || { c: char, n: char, k: [] };
+  };
+
+  const closeEmojiPicker = () => {
+    emojiPickerEl?.remove();
+    emojiPickerEl = null;
+  };
+  const onPickerOutside = (e) => {
+    if (!emojiPickerEl) {
+      document.removeEventListener('mousedown', onPickerOutside, { capture: true });
+      return;
+    }
+    if (emojiPickerEl.contains(e.target)) return;
+    closeEmojiPicker();
+    document.removeEventListener('mousedown', onPickerOutside, { capture: true });
+  };
+
+  /**
+   * Categorised + searchable emoji picker. Data comes from {@code window.EMOJI_DATA}
+   * (loaded by emoji-data.js). If that's missing we fall back to the small reaction-only
+   * set. {@code anchor} is the button the popover floats above; {@code onPick(emoji)}
+   * fires on selection.
+   */
+  const openEmojiPicker = (anchor, onPick) => {
+    closeEmojiPicker();
+    if (!anchor) return;
+    const groups = (window.EMOJI_DATA && window.EMOJI_DATA.groups)
+      ? window.EMOJI_DATA.groups
+      : [{ name: 'Common', icon: '😀', emojis: REACTION_PICKER_EMOJI.map((c) => ({ c, n: c, k: [] })) }];
+
+    // Read on every open, not once at load: a pick made in another picker (or another tab) should
+    // be at the top the next time this one opens.
+    const recent = readRecentEmoji();
+    // With nothing used yet there is no section and no tab — the picker is exactly what it was.
+    // A "Recently used (empty)" header would be a promise of a feature rather than the feature.
+    const displayGroups = recent.length
+      ? [{ name: 'Recently used', icon: '🕘', emojis: recent.map(emojiEntry) }, ...groups]
+      : groups;
+
+    const picker = document.createElement('div');
+    picker.className = 'emoji-picker';
+    picker.setAttribute('role', 'dialog');
+
+    const searchWrap = document.createElement('div');
+    searchWrap.className = 'emoji-picker-search';
+    const search = document.createElement('input');
+    search.type = 'search';
+    search.placeholder = 'Search emoji…';
+    search.className = 'emoji-picker-search-input';
+    search.autocomplete = 'off';
+    searchWrap.appendChild(search);
+    picker.appendChild(searchWrap);
+
+    const tabs = document.createElement('div');
+    tabs.className = 'emoji-picker-tabs';
+    displayGroups.forEach((g, i) => {
+      const tab = document.createElement('button');
+      tab.type = 'button';
+      tab.className = 'emoji-picker-tab' + (i === 0 ? ' active' : '');
+      tab.dataset.group = String(i);
+      tab.textContent = g.icon;
+      tab.title = g.name;
+      tabs.appendChild(tab);
+    });
+    picker.appendChild(tabs);
+
+    const results = document.createElement('div');
+    results.className = 'emoji-picker-results';
+    picker.appendChild(results);
+
+    const buildEmojiBtn = (e) => {
+      const b = document.createElement('button');
+      b.type = 'button';
+      b.className = 'emoji-picker-btn';
+      b.textContent = e.c;
+      b.title = e.n;
+      b.addEventListener('click', () => {
+        rememberEmoji(e.c);
+        closeEmojiPicker();
+        onPick(e.c);
+      });
+      return b;
+    };
+    const matches = (emoji, lower) => {
+      if (emoji.n && emoji.n.toLowerCase().includes(lower)) return true;
+      if (emoji.k) for (const k of emoji.k) if (k.toLowerCase().includes(lower)) return true;
+      return false;
+    };
+    const renderGroups = () => {
+      // Every section into one fragment, attached once: each section used to go into the live
+      // grid on its own, so opening the picker (and every clearing of the search box) re-laid it
+      // once per category.
+      const sections = document.createDocumentFragment();
+      displayGroups.forEach((g, i) => {
+        const section = document.createElement('section');
+        section.className = 'emoji-picker-section';
+        section.dataset.group = String(i);
+        const h = document.createElement('h4');
+        h.textContent = g.name;
+        section.appendChild(h);
+        const grid = document.createElement('div');
+        grid.className = 'emoji-picker-grid';
+        for (const e of g.emojis) grid.appendChild(buildEmojiBtn(e));
+        section.appendChild(grid);
+        sections.appendChild(section);
+      });
+      results.replaceChildren(sections);
+    };
+    const renderSearch = (q) => {
+      results.innerHTML = '';
+      const lower = q.toLowerCase();
+      const grid = document.createElement('div');
+      grid.className = 'emoji-picker-grid';
+      let n = 0;
+      // `groups`, not `displayGroups`: searching the recents as well would return every match
+      // twice, once from the shortcut and once from the category it actually lives in.
+      outer: for (const g of groups) {
+        for (const e of g.emojis) {
+          if (matches(e, lower)) {
+            grid.appendChild(buildEmojiBtn(e));
+            if (++n >= 200) break outer;
+          }
+        }
+      }
+      if (n === 0) {
+        const empty = document.createElement('div');
+        empty.className = 'emoji-picker-empty';
+        empty.textContent = 'No emoji found.';
+        results.appendChild(empty);
+      } else {
+        results.appendChild(grid);
+      }
+    };
+
+    tabs.addEventListener('click', (ev) => {
+      const tab = ev.target.closest('.emoji-picker-tab');
+      if (!tab) return;
+      const idx = tab.dataset.group;
+      tabs.querySelectorAll('.emoji-picker-tab').forEach((t) => t.classList.toggle('active', t === tab));
+      const section = results.querySelector('.emoji-picker-section[data-group="' + idx + '"]');
+      if (section) section.scrollIntoView({ behavior: 'auto', block: 'start' });
+    });
+    results.addEventListener('scroll', () => {
+      const sections = results.querySelectorAll('.emoji-picker-section');
+      const top = results.scrollTop;
+      let active = sections[0];
+      sections.forEach((s) => { if (s.offsetTop - 20 <= top) active = s; });
+      const idx = active?.dataset.group;
+      tabs.querySelectorAll('.emoji-picker-tab').forEach((t) => {
+        t.classList.toggle('active', t.dataset.group === idx);
+      });
+    }, { passive: true });
+
+    let debounce;
+    search.addEventListener('input', () => {
+      clearTimeout(debounce);
+      const q = search.value.trim();
+      debounce = setTimeout(() => {
+        if (q.length === 0) { tabs.style.display = ''; renderGroups(); }
+        else { tabs.style.display = 'none'; renderSearch(q); }
+      }, 80);
+    });
+    search.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Escape') { ev.preventDefault(); closeEmojiPicker(); }
+    });
+
+    renderGroups();
+    document.body.appendChild(picker);
+    // Measure the anchor and the picker once each, then write. Reading offsetHeight and then
+    // offsetWidth after each style write made the browser lay the page out three times to place
+    // one popup; one rect read answers both questions.
+    const rect = anchor.getBoundingClientRect();
+    picker.style.position = 'fixed';
+    const size = picker.getBoundingClientRect();
+    const desiredTop = rect.top - size.height - 6;
+    picker.style.top = Math.max(8, desiredTop) + 'px';
+    const desiredLeft = rect.left - size.width + rect.width;
+    picker.style.left = Math.max(8, Math.min(desiredLeft, window.innerWidth - size.width - 8)) + 'px';
+    emojiPickerEl = picker;
+    // Autofocus the search on desktop only — on touch devices it would pop the
+    // software keyboard over the picker the moment it opens.
+    if (!touchOnly.matches) setTimeout(() => search.focus());
+    setTimeout(() => document.addEventListener('mousedown', onPickerOutside, { capture: true }));
+  };
+
+  // ---------- Author handle (@username next to display name) ----------
+  /**
+   * Append the @handle next to an author's display name. Skipped when the user has
+   * no distinct display name (so we don't render the redundant "alice @alice").
+   */
+  const appendAuthorHandle = (metaEl, displayName, username) => {
+    if (!username) return;
+    if (!displayName || displayName === username) return;
+    const handle = document.createElement('span');
+    handle.className = 'author-handle';
+    handle.dataset.author = username;
+    handle.textContent = '@' + username;
+    metaEl.append(handle);
+  };
+
+  // ---------- Touch long-press → message action sheet ----------
+  // Touch devices have no hover, so message actions are reached Slack-style:
+  // press and hold for ~500ms (the platform long-press convention — ~400ms
+  // Android, ~500ms iOS) and a bottom sheet slides up with a quick-reaction
+  // emoji strip plus one large row per action. The rows are built from the
+  // message's own hidden .message-actions buttons, so whatever actions a page
+  // grants for that message (edit/delete/reply/…) appear with no duplicated
+  // logic — tapping a row forwards the click to the original button. Pointer
+  // Events carry the input type, so mouse and pen keep CSS :hover behaviour.
+  const LONG_PRESS_MS = 500;
+  const LONG_PRESS_SLOP_PX = 10; // finger drift beyond this is a scroll, not a press
+  const touchOnly = window.matchMedia('(hover: none) and (pointer: coarse)');
+
+  // Pages register their reaction toggler (channels and DMs hit different
+  // endpoints); the sheet's emoji strip is hidden until one is registered.
+  let quickReactionFn = null;
+  const setQuickReaction = (fn) => { quickReactionFn = fn; };
+
+  let sheetEl = null;
+  let sheetBackdropEl = null;
+  let sheetCloseTimer = null;
+
+  const closeMessageSheet = () => {
+    if (!sheetEl || sheetEl.hidden) return;
+    sheetEl.classList.remove('open');
+    sheetBackdropEl.classList.remove('open');
+    clearTimeout(sheetCloseTimer);
+    // Keep display until the slide-down transition ends.
+    sheetCloseTimer = setTimeout(() => {
+      sheetEl.hidden = true;
+      sheetBackdropEl.hidden = true;
+    }, 240);
+  };
+
+  const ensureSheet = () => {
+    if (sheetEl) return;
+    sheetBackdropEl = document.createElement('div');
+    sheetBackdropEl.className = 'action-sheet-backdrop';
+    sheetBackdropEl.hidden = true;
+    sheetEl = document.createElement('div');
+    sheetEl.className = 'action-sheet';
+    sheetEl.hidden = true;
+    sheetEl.setAttribute('role', 'dialog');
+    sheetEl.setAttribute('aria-modal', 'true');
+    sheetEl.setAttribute('aria-label', 'Message actions');
+    document.body.append(sheetBackdropEl, sheetEl);
+    sheetBackdropEl.addEventListener('pointerdown', (e) => {
+      e.preventDefault();
+      closeMessageSheet();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeMessageSheet();
+    });
+  };
+
+  const openMessageSheet = (li) => {
+    ensureSheet();
+    sheetEl.textContent = '';
+    const handle = document.createElement('div');
+    handle.className = 'action-sheet-handle';
+    sheetEl.append(handle);
+
+    // Quick-reaction strip — only when this message is reactable (the page adds a react
+    // button for anything the viewer may react to, own messages included) and a toggler
+    // is registered. Still a presence test rather than an assumption: a page that renders
+    // messages without a react action gets a sheet without an emoji strip.
+    if (quickReactionFn && li.dataset.id
+        && li.querySelector('.msg-action[data-action="react"]')) {
+      const strip = document.createElement('div');
+      strip.className = 'action-sheet-reactions';
+      for (const emoji of REACTION_PICKER_EMOJI) {
+        const mine = !!li.querySelector(
+            '.reaction[data-emoji="' + emoji + '"][data-mine="true"]');
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'action-sheet-reaction' + (mine ? ' mine' : '');
+        btn.textContent = emoji;
+        btn.title = (mine ? 'Remove ' : 'React with ') + emoji;
+        btn.addEventListener('click', () => {
+          closeMessageSheet();
+          // Reacting counts as using it; un-reacting does not. Tapping 👍 off a message is not a
+          // statement that 👍 is one of your emoji.
+          if (!mine) rememberEmoji(emoji);
+          quickReactionFn(li.dataset.id, emoji, mine);
+        });
+        strip.append(btn);
+      }
+      sheetEl.append(strip);
+    }
+
+    const list = document.createElement('div');
+    list.className = 'action-sheet-items';
+    // Every action, including the ones a pointer device hides behind the ⋯ overflow — the sheet is
+    // full-width labelled rows and has the room the hover strip does not. The ⋯ itself is excluded:
+    // a list that already contains everything has no "more" to offer.
+    li.querySelectorAll('.msg-action:not([data-action="react"]):not([data-action="more"])')
+        .forEach((orig) => {
+      const row = document.createElement('button');
+      row.type = 'button';
+      row.className = 'action-sheet-item';
+      row.dataset.action = orig.dataset.action || '';
+      const icon = document.createElement('span');
+      icon.className = 'action-sheet-icon';
+      // The action buttons hold an <svg><use/></svg>, so textContent is empty — clone the node.
+      // The textContent branch is the fallback for any caller still rendering a glyph.
+      const svg = orig.querySelector('svg');
+      if (svg) icon.append(svg.cloneNode(true));
+      else icon.textContent = orig.textContent;
+      const label = document.createElement('span');
+      // Falls back to textContent only for a glyph button; every SVG one sets a title.
+      label.textContent = orig.title || orig.textContent;
+      row.append(icon, label);
+      row.addEventListener('click', () => {
+        closeMessageSheet();
+        orig.click(); // the page's existing delegated handler does the rest
+      });
+      list.append(row);
+    });
+    sheetEl.append(list);
+    if (!list.children.length && sheetEl.children.length < 3) return; // nothing to offer
+
+    clearTimeout(sheetCloseTimer);
+    sheetEl.hidden = false;
+    sheetBackdropEl.hidden = false;
+    requestAnimationFrame(() => {
+      sheetEl.classList.add('open');
+      sheetBackdropEl.classList.add('open');
+    });
+  };
+
+  // Releasing a long-press can still synthesize a click on whatever is under the
+  // finger (worst case: a link in the message body navigates away). Swallow the
+  // first click after the sheet opens unless it lands on the sheet itself.
+  const swallowNextClick = () => {
+    const swallow = (e) => {
+      document.removeEventListener('click', swallow, true);
+      if (!(e.target instanceof Element) || !e.target.closest('.action-sheet')) {
+        e.preventDefault();
+        e.stopPropagation();
+      }
+    };
+    document.addEventListener('click', swallow, true);
+    setTimeout(() => document.removeEventListener('click', swallow, true), 600);
+  };
+
+  (function initLongPressActions() {
+    let timer = null;
+    let startX = 0;
+    let startY = 0;
+    const cancel = () => {
+      clearTimeout(timer);
+      timer = null;
+    };
+    document.addEventListener('pointerdown', (e) => {
+      if (e.pointerType !== 'touch' || !touchOnly.matches) return;
+      if (!(e.target instanceof Element)) return;
+      const msg = e.target.closest('.message');
+      if (!msg || !msg.querySelector('.message-actions')) return;
+      startX = e.clientX;
+      startY = e.clientY;
+      timer = setTimeout(() => {
+        timer = null;
+        openMessageSheet(msg);
+        swallowNextClick();
+        navigator.vibrate?.(10); // subtle haptic on Android; no-op elsewhere
+      }, LONG_PRESS_MS);
+    });
+    document.addEventListener('pointermove', (e) => {
+      if (timer !== null
+          && Math.hypot(e.clientX - startX, e.clientY - startY) > LONG_PRESS_SLOP_PX) {
+        cancel();
+      }
+    });
+    document.addEventListener('pointerup', cancel);
+    document.addEventListener('pointercancel', cancel); // browser took over (scroll)
+    // Android fires contextmenu (the text-selection sheet) at its own long-press
+    // threshold; suppress it inside messages so it doesn't fight the action sheet.
+    // Desktop right-click is unaffected because touchOnly never matches there.
+    document.addEventListener('contextmenu', (e) => {
+      if (touchOnly.matches && e.target instanceof Element && e.target.closest('.message')) {
+        e.preventDefault();
+      }
+    });
+  })();
+
+  // ---------- Removed attachment ----------
+  // A file deleted from the file manager leaves its message standing, so the message has to say
+  // what happened. Rendered as plain text, not a link: the bytes are gone, and a download that
+  // 404s is worse than no download. Named and dated because "a file used to be here" invites the
+  // question this answers.
+  const formatRemovedAt = (iso) => (iso ? ChatTime.formatDateTime(iso) : '');
+
+  const buildRemovedAttachmentEl = (a) => {
+    const el = document.createElement('span');
+    el.className = 'attachment attachment-removed';
+    el.innerHTML =
+        '<svg class="icon attachment-icon" aria-hidden="true"><use href="#icon-paperclip"/></svg>' +
+        '<span class="attachment-info">' +
+          '<span class="attachment-name"></span>' +
+          '<span class="attachment-meta"></span>' +
+        '</span>';
+    el.querySelector('.attachment-name').textContent = a.filename || 'File';
+    const when = formatRemovedAt(a.deletedAt);
+    el.querySelector('.attachment-meta').textContent =
+        'Deleted' + (when ? ' ' + when : '') + (a.deletedBy ? ' by ' + a.deletedBy : '');
+    el.title = el.querySelector('.attachment-meta').textContent;
+    return el;
+  };
+
+  // ---------- Attachment chips ----------
+  /**
+   * The tray of files under a message, and the chips in it. One builder for both feeds, their
+   * update paths and their thread panels — the channel page and the DM page each had their own
+   * copy of this, identical down to the comments, which is exactly the arrangement that let the
+   * image lightbox exist on one page and not the other for months.
+   * templates/fragments/attachments.html draws the same markup for the history Thymeleaf renders;
+   * keep the two in step.
+   *
+   * <p>Three shapes: a tombstone for a file deleted from the file manager, a picture, and a chip
+   * for everything else. A chip whose file the server can show as a document (the DTO's
+   * previewUrl — markdown and HTML today) gets a preview button beside its download, in a wrapper
+   * rather than inside the chip: the chip is an <a> and a button inside a link is neither valid
+   * markup nor operable by a keyboard.
+   *
+   * <p>A video is a chip too, carrying data-video-type, and becomes a player here (see
+   * upgradeVideoCard below) when this browser says it can play the type. The player takes the
+   * chip's place inside the same row, with the chip kept underneath as its caption — the same DOM
+   * the DOM-ready sweep makes of a server-rendered video chip.
+   */
+  const buildAttachmentEl = (a) => {
+    // Tombstone: the file was deleted from the file manager, the message stayed.
+    if (a.deletedAt) return buildRemovedAttachmentEl(a);
+    const isImage = (a.contentType || '').startsWith('image/');
+    const link = document.createElement('a');
+    link.href = a.downloadUrl;
+    link.title = a.filename;
+    if (isImage) {
+      link.className = 'attachment-image';
+      // Keep href + target so middle-click and "Open in new tab" still work; left-click is
+      // intercepted by the document-level delegate that opens the viewer.
+      link.target = '_blank';
+      link.rel = 'noopener';
+      const img = document.createElement('img');
+      img.src = a.downloadUrl;
+      img.alt = a.filename;
+      img.loading = 'lazy';
+      link.append(img);
+      return link;
+    }
+    if (a.videoType) {
+      const kept = takeDetachedPlayer(a.downloadUrl);
+      if (kept) return buildAttachmentRow(kept, a);
+    }
+    link.className = 'attachment';
+    link.dataset.contentType = a.contentType;
+    if (a.videoType) link.dataset.videoType = a.videoType;
+    link.innerHTML = '<svg class="icon attachment-icon"><use href="#icon-' +
+          (a.videoType ? 'video' : 'paperclip') + '"/></svg>' +
+        '<span class="attachment-info"><span class="attachment-name"></span>' +
+        '<span class="attachment-meta"></span></span>' +
+        '<svg class="icon attachment-download"><use href="#icon-download"/></svg>';
+    link.querySelector('.attachment-name').textContent = a.filename;
+    link.querySelector('.attachment-meta').textContent =
+        (a.contentType || '') + ' · ' + formatBytes(a.sizeBytes);
+    return buildAttachmentRow(a.videoType ? upgradeVideoCard(link) : link, a);
+  };
+
+  // The wrapper is unconditional, so a chip with a preview button and one without lay out
+  // identically — and so this and the Thymeleaf mirror produce the same DOM for the same file.
+  const buildAttachmentRow = (chip, a) => {
+    const row = document.createElement('span');
+    row.className = 'attachment-row';
+    row.append(chip);
+    if (a.previewUrl) row.append(buildPreviewButton(a));
+    return row;
+  };
+
+  const buildPreviewButton = (a) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'attachment-preview';
+    button.title = 'Show ' + a.filename;
+    button.setAttribute('aria-label', 'Show ' + a.filename);
+    // The delegate reads these rather than closing over the attachment, because the identical
+    // button is server-rendered by Thymeleaf for the history and one click handler serves both.
+    button.dataset.previewUrl = a.previewUrl;
+    button.dataset.previewKind = a.previewKind || '';
+    button.dataset.downloadUrl = a.downloadUrl || '';
+    button.dataset.filename = a.filename || '';
+    button.innerHTML = '<svg class="icon"><use href="#icon-eye"/></svg>';
+    return button;
+  };
+
+  const buildAttachmentTray = (attachments) => {
+    const tray = document.createElement('div');
+    tray.className = 'message-attachments';
+    for (const a of attachments || []) tray.append(buildAttachmentEl(a));
+    return tray;
+  };
+
+  // ---------- Video attachments ----------
+  /*
+   * A video arrives as an ordinary file card carrying data-video-type (the server's
+   * AttachmentMedia decides that, from the stored row, so files uploaded before this existed
+   * qualify too). Whether it becomes a player is the browser's call and nobody else's: the server
+   * cannot know what this browser decodes, and an AVI or a Matroska file is a video on every
+   * browser and playable on few. So the card is the starting point and the fallback, and the
+   * player is an enhancement made here — once, for live-rendered cards (buildAttachmentEl) and
+   * for the history Thymeleaf drew (the DOM-ready sweep below) alike.
+   *
+   * Two gates. canPlayType answers "is it worth asking", and an '' means no request is made at
+   * all. Then the element's own `error` answers the rest — "maybe" is a guess, and an MP4 holding
+   * HEVC is "maybe" on a browser with no HEVC decoder — by putting the card back. Either way the
+   * card says why there is no player, so a missing one doesn't read as a bug.
+   *
+   * The player sits in a fixed 16:9 box (app.css), so its metadata arriving never changes the
+   * feed's height — the image-load scroll-pinning in both pages has nothing to do for it.
+   */
+  const videoProbe = document.createElement('video');
+  // QuickTime, .m4v and 3GPP are ISO base media files, the box structure MP4 itself was
+  // derived from. Chromium's MP4 demuxer reads them, yet canPlayType answers '' for their own
+  // names — so an iPhone's .mov would never be tried. Ask about MP4 instead; if the codec inside
+  // turns out not to be decodable, the error handler restores the card.
+  const ISO_BMFF_VIDEO = new Set(['video/quicktime', 'video/x-m4v', 'video/3gpp']);
+  const canPlayVideo = (type) => {
+    if (!type || typeof videoProbe.canPlayType !== 'function') return false;
+    if (videoProbe.canPlayType(type) !== '') return true;
+    return ISO_BMFF_VIDEO.has(type) && videoProbe.canPlayType('video/mp4') !== '';
+  };
+
+  /*
+   * A player outlives the tray it was built in. Every update to a message — a reaction, an edit,
+   * a reply count — takes its attachment tray out and builds a new one from the DTO, and a fresh
+   * <video> for the same file would stop whoever is watching, rewind them to 0:00 and fetch the
+   * metadata again (against the download rate limit, too). So a player that has just been taken
+   * out of the document is handed to the next tray built for the same file. The callers remove
+   * the old tray and append the new one in the same task, and a media element only pauses itself
+   * if it is still out of the document once that task ends, so playback carries straight on.
+   * (Fullscreen does not survive: leaving the document ends it at once, whatever happens next.)
+   *
+   * Weak references, so a player whose message is gone for good is not kept alive by this map;
+   * a list per URL, because one file can be on screen twice — the feed and a thread panel.
+   */
+  const playersByUrl = new Map();
+  const rememberPlayer = (url, wrap) => {
+    const refs = (playersByUrl.get(url) || []).filter((r) => r.deref());
+    refs.push(new WeakRef(wrap));
+    playersByUrl.set(url, refs);
+  };
+  const forgetPlayer = (url, wrap) => {
+    const refs = (playersByUrl.get(url) || []).filter((r) => r.deref() && r.deref() !== wrap);
+    if (refs.length) playersByUrl.set(url, refs); else playersByUrl.delete(url);
+  };
+  const takeDetachedPlayer = (url) => {
+    if (typeof WeakRef !== 'function') return null;
+    for (const ref of playersByUrl.get(url) || []) {
+      const wrap = ref.deref();
+      if (wrap && !wrap.isConnected) return wrap;
+    }
+    return null;
+  };
+
+  const markUnplayable = (card) => {
+    card.dataset.videoState = 'unplayable';
+    const meta = card.querySelector('.attachment-meta');
+    if (!meta || meta.querySelector('.attachment-note')) return;
+    const note = document.createElement('span');
+    note.className = 'attachment-note';
+    note.textContent = ' · Can’t play in this browser';
+    meta.appendChild(note);
+  };
+
+  /**
+   * Turn a video card into a player when this browser can play it, keeping the card itself as
+   * the caption underneath (name, type, size, download). Returns whichever element now stands for
+   * the attachment; a card that is already in the document is swapped in place.
+   */
+  const upgradeVideoCard = (card) => {
+    if (card.dataset.videoState) return card.closest('.attachment-video') || card;
+    if (!canPlayVideo(card.dataset.videoType)) {
+      markUnplayable(card);
+      return card;
+    }
+    card.dataset.videoState = 'player';
+    const wrap = document.createElement('div');
+    wrap.className = 'attachment-video';
+    const video = document.createElement('video');
+    video.className = 'attachment-video-player';
+    video.controls = true;
+    // Enough for the duration and, on most browsers, the first frame — not the whole file.
+    video.preload = 'metadata';
+    video.playsInline = true;
+    video.setAttribute('aria-label', card.title || 'Video');
+    const href = card.getAttribute('href');
+    // Listening before src is set, so not even an instant failure can slip past. A failed player
+    // is also forgotten, or the next rebuild of its message would hand the broken one back.
+    video.addEventListener('error', () => {
+      video.removeAttribute('src');
+      forgetPlayer(href, wrap);
+      if (wrap.parentNode) wrap.replaceWith(card);
+      markUnplayable(card);
+    }, { once: true });
+    // inline, so the player's own "Open video in new tab" plays the file rather than saving it.
+    video.src = href + (href.indexOf('?') === -1 ? '?' : '&') + 'disposition=inline';
+    if (card.parentNode) card.replaceWith(wrap);
+    wrap.append(video, card);
+    if (typeof WeakRef === 'function') rememberPlayer(href, wrap);
+    return wrap;
+  };
+
+  const upgradeVideoCards = (root) => {
+    root.querySelectorAll('a.attachment[data-video-type]:not([data-video-state])')
+        .forEach(upgradeVideoCard);
+  };
+  // The server-rendered history, swept once here for every page — the same reasoning as the
+  // highlightCode sweep above: a line each page's own script must remember is a line one forgets.
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', () => upgradeVideoCards(document), { once: true });
+  } else {
+    upgradeVideoCards(document);
+  }
+
+  // ---------- Link preview card ----------
+  // The card under a message that contains a link: site, title, description, and the server's
+  // copy of the page's picture. One builder for every renderer on both pages — the channel feed,
+  // its update path and thread panel, the conversation feed and its thread panel — because a
+  // card built in five places is five cards that drift. Server-rendered messages get the same
+  // markup from templates/fragments/link-preview.html; keep the two in step.
+  //
+  // The whole card is one <a>: it opens the page in a new tab exactly like the link in the body
+  // does, with the same rel. The image is NOT class="attachment-image", on purpose — that class
+  // is what the lightbox delegate catches, and a preview picture is a link to a page, not a
+  // picture to zoom.
+  /*
+   * A video link's card is a click-to-play facade, not a player.
+   *
+   * The server used to inject the <iframe> straight into the message body, which meant every
+   * reader's browser called YouTube just for scrolling past someone else's link — the exact leak
+   * that makes link-preview pictures a server-side *copy* served from this origin. Now the poster
+   * is that same copied picture, and the iframe is built here, once, by the person who actually
+   * wants to watch. See linkpreview/VideoLinks for the full reasoning.
+   *
+   * Markup is mirrored by fragments/link-preview.html for server-rendered messages, and the click
+   * is handled by one delegated listener below so both kinds of card behave the same.
+   */
+  const buildVideoFacadeEl = (p) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'link-preview link-preview-video';
+    if (p.video.orientation) wrap.dataset.orientation = p.video.orientation;
+
+    const play = document.createElement('button');
+    play.type = 'button';
+    play.className = 'video-facade';
+    // The embed URL is the server's, built from a regex-matched id — the client never assembles a
+    // third-party URL out of parts, which is what keeps frame-src meaningful.
+    play.dataset.embedUrl = p.video.embedUrl;
+    play.setAttribute('aria-label', p.title ? 'Play ' + p.title : 'Play video');
+    if (p.imageUrl) {
+      const poster = document.createElement('img');
+      poster.className = 'video-facade-poster';
+      poster.src = p.imageUrl;
+      poster.alt = '';
+      poster.loading = 'lazy';
+      play.appendChild(poster);
+    }
+    const glyph = document.createElement('span');
+    glyph.className = 'video-facade-play';
+    glyph.innerHTML = '<svg class="icon" aria-hidden="true"><use href="#icon-play"/></svg>';
+    play.appendChild(glyph);
+    wrap.appendChild(play);
+
+    // The words stay a plain link to the page, so the card still gets you there without playing.
+    if (p.title || p.siteName) {
+      const a = document.createElement('a');
+      a.className = 'link-preview-text';
+      a.href = p.url;
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer nofollow';
+      if (p.siteName || p.video.provider) {
+        const site = document.createElement('span');
+        site.className = 'link-preview-site';
+        site.textContent = p.siteName || p.video.provider;
+        a.appendChild(site);
+      }
+      if (p.title) {
+        const title = document.createElement('span');
+        title.className = 'link-preview-title';
+        title.textContent = p.title;
+        a.appendChild(title);
+      }
+      wrap.appendChild(a);
+    }
+    return wrap;
+  };
+
+  /** Swap a facade for the real player. The one place an embed iframe is ever created. */
+  const playVideoFacade = (button) => {
+    const wrap = button.closest('.link-preview-video');
+    const src = button.dataset.embedUrl;
+    if (!wrap || !src) return;
+    const frame = document.createElement('iframe');
+    frame.className = 'video-embed';
+    // autoplay=1 because the click *was* the play instruction; without it the reader has to press
+    // play twice, once in our UI and once in YouTube's.
+    frame.src = src + (src.includes('?') ? '&' : '?') + 'autoplay=1';
+    frame.title = wrap.querySelector('.link-preview-title')?.textContent || 'Video';
+    frame.loading = 'lazy';
+    frame.allowFullscreen = true;
+    frame.setAttribute('allow',
+        'accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture');
+    wrap.classList.add('is-playing');
+    button.replaceWith(frame);
+  };
+
+  document.addEventListener('click', (e) => {
+    const button = e.target.closest?.('.video-facade');
+    if (button) playVideoFacade(button);
+  });
+
+  const buildLinkPreviewEl = (p) => {
+    if (!p || !p.url) return null;
+    if (p.video) return buildVideoFacadeEl(p);
+    if (!p.title) return null;
+    const a = document.createElement('a');
+    a.className = 'link-preview';
+    a.href = p.url;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer nofollow';
+    if (p.imageUrl) {
+      const img = document.createElement('img');
+      img.className = 'link-preview-image';
+      img.src = p.imageUrl;
+      img.alt = '';
+      img.loading = 'lazy';
+      a.appendChild(img);
+    }
+    const text = document.createElement('span');
+    text.className = 'link-preview-text';
+    if (p.siteName) {
+      const site = document.createElement('span');
+      site.className = 'link-preview-site';
+      site.textContent = p.siteName;
+      text.appendChild(site);
+    }
+    const title = document.createElement('span');
+    title.className = 'link-preview-title';
+    title.textContent = p.title;
+    text.appendChild(title);
+    if (p.description) {
+      const desc = document.createElement('span');
+      desc.className = 'link-preview-desc';
+      desc.textContent = p.description;
+      text.appendChild(desc);
+    }
+    a.appendChild(text);
+    return a;
+  };
+
+  // Put the card on a message <li>, replacing one it already has; a null card removes it. Used
+  // by the `link-preview` event handlers on both pages and by the builders, so "where in the
+  // message does the card go" is decided once: right after the body, before attachments and
+  // reactions, which is where the link it belongs to is.
+  const applyLinkPreview = (li, preview) => {
+    if (!li) return;
+    const col = li.querySelector(':scope > div') || li;
+    const existing = col.querySelector(':scope > .link-preview');
+    const el = buildLinkPreviewEl(preview);
+    if (existing) {
+      if (el) existing.replaceWith(el); else existing.remove();
+      return;
+    }
+    if (!el) return;
+    const body = col.querySelector(':scope > .message-body');
+    if (body) body.after(el); else col.appendChild(el);
+  };
+
+  // ---------- Attachment viewer ----------
+  // One overlay, three things it can hold: a picture, a rendered markdown document, and a
+  // sandboxed frame around an uploaded HTML file. It is one overlay because the chrome is the
+  // same question every time — a title, a download, a way out — and because Escape, the backdrop
+  // click and the scroll lock on <body> are the kind of thing that gets forgotten in the second
+  // copy. What differs per kind is only which node is shown and what is put in it.
+  //
+  // Clicking an image attachment opens it in place rather than navigating away. Shared because
+  // both pages have image attachments and only one of them had this: the conversation page opened
+  // a new browser tab instead, which is a different product decision made by accident, in a copy
+  // nobody compared.
+  let viewerEl = null;
+  const ensureViewer = () => {
+    if (viewerEl) return viewerEl;
+    viewerEl = document.createElement('div');
+    viewerEl.className = 'lightbox';
+    viewerEl.setAttribute('role', 'dialog');
+    viewerEl.setAttribute('aria-modal', 'true');
+    viewerEl.hidden = true;
+    viewerEl.innerHTML =
+        '<div class="lightbox-toolbar">' +
+          '<span class="lightbox-title"></span>' +
+          '<a class="lightbox-btn" data-action="download" title="Download" aria-label="Download">' +
+            '<svg class="icon"><use href="#icon-download"/></svg>' +
+          '</a>' +
+          '<a class="lightbox-btn" data-action="open" target="_blank" rel="noopener" title="Open in new tab" aria-label="Open in new tab">' +
+            '<svg class="icon"><use href="#icon-external"/></svg>' +
+          '</a>' +
+          '<button type="button" class="lightbox-btn" data-action="close" title="Close (Esc)" aria-label="Close">' +
+            '<svg class="icon"><use href="#icon-close"/></svg>' +
+          '</button>' +
+        '</div>' +
+        '<img class="lightbox-img" alt=""/>' +
+        '<div class="lightbox-doc" hidden><div class="lightbox-sheet">' +
+          '<p class="lightbox-note" hidden></p>' +
+          '<div class="message-body lightbox-doc-body"></div>' +
+        '</div></div>' +
+        '<div class="lightbox-frame-wrap" hidden>' +
+          '<p class="lightbox-note" hidden></p>' +
+          '<div class="lightbox-frame-slot"></div>' +
+        '</div>' +
+        '<p class="lightbox-status" hidden></p>';
+    document.body.appendChild(viewerEl);
+    viewerEl.addEventListener('click', (e) => {
+      if (e.target === viewerEl) closeViewer();
+    });
+    viewerEl.querySelector('[data-action="close"]').addEventListener('click', closeViewer);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && viewerEl && !viewerEl.hidden) closeViewer();
+    });
+    return viewerEl;
+  };
+
+  // Which of the content nodes is on show — 'image', 'doc', 'frame', or 'none' while a preview is
+  // still being fetched. Everything else about the overlay is shared, so this is the whole of
+  // "what kind of thing am I looking at".
+  const setViewerMode = (el, mode) => {
+    el.querySelector('.lightbox-img').hidden = mode !== 'image';
+    el.querySelector('.lightbox-doc').hidden = mode !== 'doc';
+    el.querySelector('.lightbox-frame-wrap').hidden = mode !== 'frame';
+    // Open-in-tab is offered only for images: the download endpoint serves everything else as an
+    // attachment on purpose (inline user-uploaded bytes in this origin is stored XSS), so the
+    // button would silently download instead of opening.
+    el.querySelector('[data-action="open"]').hidden = mode !== 'image';
+  };
+
+  const showViewer = (el, mode, opts = {}) => {
+    setViewerMode(el, mode);
+    const dl = el.querySelector('[data-action="download"]');
+    dl.hidden = !opts.downloadUrl;
+    if (opts.downloadUrl) {
+      dl.href = opts.downloadUrl;
+      dl.setAttribute('download', opts.filename || '');
+    }
+    el.querySelector('.lightbox-title').textContent = opts.filename || '';
+    el.setAttribute('aria-label', opts.filename ? 'Preview of ' + opts.filename : 'File preview');
+    setViewerStatus(el, opts.status || '');
+    el.hidden = false;
+    document.body.classList.add('lightbox-open');
+  };
+
+  const setViewerStatus = (el, text) => {
+    const status = el.querySelector('.lightbox-status');
+    status.textContent = text || '';
+    status.hidden = !text;
+  };
+
+  const setViewerNote = (host, text) => {
+    const note = host.querySelector('.lightbox-note');
+    note.textContent = text || '';
+    note.hidden = !text;
+  };
+
+  const TRUNCATED_NOTE = 'This file is too long to show in full — download it to read the rest.';
+
+  let viewerRequest = 0;
+
+  const openImageViewer = (url, filename) => {
+    const el = ensureViewer();
+    const img = el.querySelector('.lightbox-img');
+    img.src = url;
+    img.alt = filename || '';
+    showViewer(el, 'image', { filename, downloadUrl: url });
+    // The download endpoint returns Content-Disposition: attachment by default, which would
+    // trigger a download instead of rendering in the new tab. Ask for inline disposition here.
+    const sep = url.indexOf('?') === -1 ? '?' : '&';
+    el.querySelector('[data-action="open"]').href = url + sep + 'disposition=inline';
+  };
+
+  /**
+   * Show an uploaded document. {@code kind} is the server's own word for it — the
+   * {@code previewKind} on the attachment DTO — so the client never guesses from a filename what
+   * a file is; see PreviewableAttachments on the Java side.
+   *
+   * <p>markdown: the server returns HTML that has already been through the message safelist, so it
+   * goes into the page through the same seam as a message body and comes out highlighted.
+   * html: the server returns the file's own markup, and the ONLY safe place for that is the
+   * sandboxed frame below.
+   */
+  const openDocumentViewer = ({ previewUrl, previewKind, downloadUrl, filename }) => {
+    if (!previewUrl) return;
+    const el = ensureViewer();
+    const frame = previewKind === 'html';
+    const host = el.querySelector(frame ? '.lightbox-frame-wrap' : '.lightbox-doc');
+    setViewerNote(host, '');
+    if (frame) {
+      el.querySelector('.lightbox-frame-slot').textContent = '';
+    } else {
+      el.querySelector('.lightbox-doc-body').textContent = '';
+    }
+    // 'none' until the bytes land: an empty sheet under a "Loading…" line reads as a document
+    // that rendered to nothing.
+    showViewer(el, 'none', { filename, downloadUrl, status: 'Loading preview…' });
+    const token = ++viewerRequest;
+    fetch(previewUrl, { headers: { Accept: 'application/json' } })
+        .then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
+        .then((data) => {
+          if (token !== viewerRequest) return; // a second preview was opened while this loaded
+          setViewerStatus(el, '');
+          setViewerMode(el, frame ? 'frame' : 'doc');
+          setViewerNote(host, data.truncated ? TRUNCATED_NOTE : '');
+          if (frame) {
+            el.querySelector('.lightbox-frame-slot').replaceChildren(
+                buildSandboxedFrame(data.source || '', filename));
+          } else {
+            renderMessageBody(el.querySelector('.lightbox-doc-body'), data.html || '');
+          }
+        })
+        .catch(() => {
+          if (token !== viewerRequest) return;
+          setViewerStatus(el, 'Sorry — that preview could not be loaded.');
+        });
+  };
+
+  /**
+   * The frame an uploaded HTML file is shown in, and the reason showing one at all is defensible.
+   *
+   * <p>A bare `sandbox` attribute — no allow-scripts, no allow-same-origin — puts the document in
+   * an opaque origin with scripting off, so it can neither run code nor reach this application's
+   * cookies, storage or DOM. Adding either token gives that away; there is no version of this
+   * feature that needs them.
+   *
+   * <p>It is `srcdoc`, not a URL, and that is load-bearing twice over. Nothing on this origin ever
+   * responds `text/html` with somebody's upload in it, so there is no address a victim could be
+   * sent to where the file would render as a top-level page. And a srcdoc document inherits this
+   * page's CSP, so the file's own `<style>` works while `img-src 'self' data:` and `connect-src
+   * 'self'` stop it fetching anything off-origin — an uploaded page cannot phone home to tell its
+   * author who read it, which is the same leak link-preview pictures are copied server-side to
+   * avoid.
+   *
+   * <p>A fresh element every time: the attribute has to be in place before the content is, and a
+   * new frame is also how the previous document is disposed of rather than left parked in memory.
+   */
+  const buildSandboxedFrame = (source, filename) => {
+    const frame = document.createElement('iframe');
+    frame.setAttribute('sandbox', '');
+    frame.setAttribute('referrerpolicy', 'no-referrer');
+    frame.className = 'lightbox-frame';
+    frame.title = filename ? 'Preview of ' + filename : 'File preview';
+    frame.srcdoc = source;
+    return frame;
+  };
+
+  const closeViewer = () => {
+    if (!viewerEl) return;
+    viewerRequest++; // an in-flight preview must not paint into a closed overlay
+    viewerEl.hidden = true;
+    viewerEl.querySelector('.lightbox-img').src = '';
+    viewerEl.querySelector('.lightbox-doc-body').textContent = '';
+    viewerEl.querySelector('.lightbox-frame-slot').textContent = '';
+    document.body.classList.remove('lightbox-open');
+  };
+
+  // One delegate covers both server-rendered messages (Thymeleaf in channels.html /
+  // conversation.html) and JS-rendered ones; otherwise the historical rows' image links would
+  // just download via href and their preview buttons would do nothing.
+  //
+  // Idempotent — the channel page calls it once and so does the conversation page, and a second
+  // call must not attach a second delegate.
+  let viewerWired = false;
+  const wireAttachmentViewer = () => {
+    if (viewerWired) return;
+    viewerWired = true;
+    document.addEventListener('click', (e) => {
+      const preview = e.target.closest?.('.attachment-preview');
+      if (preview) {
+        e.preventDefault();
+        openDocumentViewer({
+          previewUrl: preview.dataset.previewUrl,
+          previewKind: preview.dataset.previewKind,
+          downloadUrl: preview.dataset.downloadUrl,
+          filename: preview.dataset.filename,
+        });
+        return;
+      }
+      if (e.button !== 0 || e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
+      const link = e.target.closest('a.attachment-image');
+      if (!link) return;
+      e.preventDefault();
+      const img = link.querySelector('img');
+      openImageViewer(link.getAttribute('href'), img?.alt || link.title || '');
+    });
+  };
+
+  // ---------- "New messages" divider ----------
+  /**
+   * Draw the line the reader left off at: a rule across the message list, immediately above the
+   * first message they have not seen.
+   *
+   * <p>It is placed once, on first paint, from the read marker as it stood *before* the page load
+   * moved it — and then left alone. A divider that chased the marker would slide down the screen
+   * as you read and never mark anything; the whole value of the line is that it stays where your
+   * attention was when you arrived.
+   *
+   * @param list      the <ol> of messages
+   * @param sinceIso  the read marker, or falsy for "never read" (then everything is new and the
+   *                  line goes above the first message that qualifies)
+   * @param opts.me   the viewer's username — their own messages are not unread to them…
+   * @param opts.countOwn  …except in a conversation they are the only member of, where their own
+   *                  messages are the only ones there are and something else writes them.
+   * @returns the divider element, or null when nothing is unread
+   */
+  const applyUnreadDivider = (list, sinceIso, opts = {}) => {
+    if (!list) return null;
+    list.querySelector(':scope > .unread-divider')?.remove();
+    const since = sinceIso ? Date.parse(sinceIso) : NaN;
+    const rows = list.querySelectorAll(':scope > li.message');
+    let target = null;
+    for (const li of rows) {
+      if (!opts.countOwn && li.dataset.author === opts.me) continue;
+      const at = Date.parse(li.dataset.createdAt || '');
+      if (isNaN(at)) continue;
+      // A never-read conversation has no marker, so every message qualifies and the first one wins.
+      if (isNaN(since) || at > since) { target = li; break; }
+    }
+    if (!target) return null;
+    const divider = document.createElement('li');
+    divider.className = 'unread-divider';
+    divider.setAttribute('role', 'separator');
+    const label = document.createElement('span');
+    label.textContent = 'New messages';
+    divider.appendChild(label);
+    list.insertBefore(divider, target);
+    return divider;
+  };
+
+  // ---------- Typing indicator ----------
+  /**
+   * "X is typing…" — the receiving half. Names are held with an expiry rather than cleared by a
+   * stop-typing frame, because there isn't one and there shouldn't be: a client that closes its
+   * laptop mid-sentence sends nothing, and an indicator waiting for a frame that will never arrive
+   * would say somebody is typing forever. A ping refreshes the expiry, a sweep retires it, and the
+   * timer stops entirely once nobody is typing so an idle page costs no interval at all.
+   *
+   * Shared because both pages want the identical behaviour off the identical markup — a
+   * `<div class="typing-indicator" hidden>` under the message list.
+   *
+   * @param el       the element to write into
+   * @param graceMs  how long a ping keeps somebody "typing" — twice the 2s publish throttle, so a
+   *                 steady typist never flickers
+   */
+  const createTypingTracker = (el, graceMs = 4000) => {
+    const typists = new Map();
+    let sweep = null;
+
+    const render = () => {
+      if (!el) return;
+      const names = [...typists.values()].map((v) => v.displayName);
+      if (names.length === 0) {
+        el.hidden = true;
+        el.textContent = '';
+        return;
+      }
+      let text;
+      if (names.length === 1) text = names[0] + ' is typing…';
+      else if (names.length === 2) text = names[0] + ' and ' + names[1] + ' are typing…';
+      else text = names.length + ' people are typing…';
+      el.textContent = text;
+      el.hidden = false;
+    };
+
+    const tick = () => {
+      const now = Date.now();
+      let changed = false;
+      for (const [u, v] of typists) {
+        if (v.expiresAt <= now) { typists.delete(u); changed = true; }
+      }
+      if (changed) render();
+      if (typists.size === 0 && sweep) { clearInterval(sweep); sweep = null; }
+    };
+
+    return {
+      note(username, displayName) {
+        if (!username) return;
+        typists.set(username, { displayName: displayName || username, expiresAt: Date.now() + graceMs });
+        render();
+        if (!sweep) sweep = setInterval(tick, 1000);
+      },
+      clear() {
+        typists.clear();
+        render();
+        if (sweep) { clearInterval(sweep); sweep = null; }
+      },
+    };
+  };
+
+  /**
+   * The sending half: call {@code ping()} as often as you like, {@code send} fires at most once per
+   * {@code everyMs}. Trailing edge is deliberately not implemented — the point is to say "still
+   * typing", and a ping that arrives after the user stopped is a lie the tracker's expiry would
+   * then hold on screen for another four seconds.
+   */
+  const throttledPing = (send, everyMs = 2000) => {
+    let last = 0;
+    return () => {
+      const now = Date.now();
+      if (now - last < everyMs) return;
+      last = now;
+      send();
+    };
+  };
+
+  // ---------- Thread indicator ----------
+  // The "N replies" widget that hangs off the bottom of a message that started a thread. Pure DOM
+  // and identical on both pages, so it lives here rather than in each page script: the channel page
+  // has its own copy today and this is the shape both should converge on.
+  const replyLabel = (n) => n + ' ' + (n === 1 ? 'reply' : 'replies');
+
+  const buildThreadIndicator = (count) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'thread-indicator';
+    btn.dataset.count = String(count);
+    btn.title = 'Open thread (' + replyLabel(count) + ')';
+    btn.innerHTML = '<svg class="icon thread-indicator-icon" aria-hidden="true">'
+        + '<use href="#icon-thread"/></svg><span class="thread-indicator-count"></span>';
+    btn.querySelector('.thread-indicator-count').textContent = replyLabel(count);
+    return btn;
+  };
+
+  /**
+   * Move a message's reply count by {@code delta}, creating the indicator on the first reply and
+   * removing it when the last one goes. {@code container} is the element the indicator belongs to —
+   * the message's content column — because that is what differs between the two pages' markup.
+   */
+  const applyThreadIndicator = (container, delta) => {
+    if (!container) return;
+    let btn = container.querySelector(':scope > .thread-indicator');
+    const count = Math.max(0, Number(btn?.dataset.count || 0) + delta);
+    if (count === 0) {
+      btn?.remove();
+      return;
+    }
+    if (!btn) {
+      btn = buildThreadIndicator(count);
+      container.appendChild(btn);
+      return;
+    }
+    btn.dataset.count = String(count);
+    btn.querySelector('.thread-indicator-count').textContent = replyLabel(count);
+    btn.title = 'Open thread (' + replyLabel(count) + ')';
+  };
+
+  // ---------- Thread panel ----------
+  /**
+   * The right-hand thread panel, as a controller over markup the page supplies.
+   *
+   * Everything in here is page-agnostic: opening and closing, the stale-response guard, Escape,
+   * the reply composer with its auto-resize and server-rendered preview. What differs between a
+   * channel thread and a conversation thread is only *where the messages come from* and *how a
+   * message is drawn*, so those are the two callbacks — {@code loadThread} / {@code postReply} and
+   * {@code renderMessage}.
+   *
+   * It lives here rather than in conversation.js because the channel page has the same panel, built
+   * the same way, and a second copy is how the two would drift; the channel page is not switched
+   * over in this change, deliberately, but this is the seam it can move to when it is.
+   *
+   * @param opts.ids            element ids: panel, parent, replies, form, input, emoji, close,
+   *                            preview, previewBody
+   * @param opts.loadThread     async (parentId) -> { parent, replies }
+   * @param opts.postReply      async (parentId, body) -> message | null
+   * @param opts.renderMessage  (message, isParent) -> HTMLLIElement
+   * @param opts.headers        () -> fetch headers, for the preview call
+   * @param opts.onError        (message) -> void; defaults to alert
+   * @returns {{open: function, close: function, appendReply: function, openId: function}}
+   */
+  const createThreadPanel = (opts) => {
+    const ids = opts.ids || {};
+    const el = (id) => (id ? document.getElementById(id) : null);
+    const panel = el(ids.panel || 'thread-panel');
+    const parentEl = el(ids.parent || 'thread-parent');
+    const repliesEl = el(ids.replies || 'thread-replies');
+    const form = el(ids.form || 'thread-composer');
+    const input = el(ids.input || 'thread-input');
+    const emojiBtn = el(ids.emoji || 'thread-emoji');
+    const closeBtn = el(ids.close || 'thread-close');
+    const fail = opts.onError || ((m) => alert(m));
+    if (!panel || !parentEl || !repliesEl) return null;
+
+    let openId = null;
+    let req = 0;
+
+    const close = () => {
+      // Bump the request id so a response still in flight can't reopen a panel the user closed.
+      req++;
+      panel.hidden = true;
+      document.body.classList.remove('thread-open');
+      openId = null;
+      parentEl.innerHTML = '';
+      repliesEl.innerHTML = '';
+      if (input) {
+        input.value = '';
+        input._autoResize?.();
+      }
+    };
+
+    const open = async (parentId) => {
+      const myReq = ++req;
+      let data;
+      try {
+        data = await opts.loadThread(parentId);
+      } catch (e) {
+        fail('Could not load thread');
+        return;
+      }
+      if (myReq !== req || !data) return; // superseded by a newer open, or closed
+      openId = parentId;
+      parentEl.innerHTML = '';
+      repliesEl.innerHTML = '';
+      parentEl.appendChild(opts.renderMessage(data.parent, true));
+      for (const r of data.replies || []) repliesEl.appendChild(opts.renderMessage(r, false));
+      panel.hidden = false;
+      document.body.classList.add('thread-open');
+      input?.focus();
+    };
+
+    /** Add a reply to the open thread. A no-op unless it belongs to the thread on screen. */
+    const appendReply = (msg) => {
+      if (!msg || panel.hidden) return;
+      if (String(msg.parentId) !== String(openId)) return;
+      // De-dupe: the sender renders from the HTTP response and the broadcast follows.
+      if (repliesEl.querySelector('[data-id="' + CSS.escape(String(msg.id)) + '"]')) return;
+      repliesEl.appendChild(opts.renderMessage(msg, false));
+      repliesEl.scrollTop = repliesEl.scrollHeight;
+    };
+
+    closeBtn?.addEventListener('click', close);
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && !panel.hidden) close();
+    });
+    emojiBtn?.addEventListener('click', () => {
+      openEmojiPicker(emojiBtn, (e) => insertAtCursor(input, e));
+    });
+
+    form?.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (openId === null) return;
+      const body = (input.value || '').trim();
+      if (!body) return;
+      let dto;
+      try {
+        dto = await opts.postReply(openId, body);
+      } catch (err) {
+        fail('Reply failed: ' + (err?.message || err));
+        return;
+      }
+      // Render from the HTTP response so the sender sees it immediately, independent of the
+      // WebSocket round trip; appendReply de-dupes so the broadcast that follows is a no-op.
+      if (dto) appendReply(dto);
+      input.value = '';
+      input._autoResize?.();
+    });
+    if (input) {
+      wireAutoResize(input);
+      input.addEventListener('keydown', (e) => {
+        if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
+        if (e.isComposing || e.keyCode === 229) return;
+        e.preventDefault();
+        form?.requestSubmit();
+      });
+      wireLivePreview({
+        textarea: input,
+        pane: el(ids.preview || 'thread-preview'),
+        body: el(ids.previewBody || 'thread-preview-body'),
+        form,
+        headers: opts.headers,
+      });
+    }
+
+    return { open, close, appendReply, openId: () => openId };
+  };
+
+  // ---------- Popover ----------
+  // Anchored dialog hung off a button, for occasional actions that would otherwise sit in the
+  // sidebar flow pushing the lists down and competing with them for attention.
+  //
+  // A popover has obligations an inline <details> block doesn't: it has to close on Escape and
+  // on a click elsewhere, or it strands the user with a floating panel and no obvious way out;
+  // and focus has to move into it on open and back to the button on close, or a keyboard user
+  // tabs into a form they can't see and never gets back.
+  //
+  // Lives here rather than in a page script because both the channel and conversation pages
+  // need it, and a second copy is how the two drift apart.
+  const wirePopover = (buttonId, popoverId, firstFieldSelector) => {
+    const button = document.getElementById(buttonId);
+    const popover = document.getElementById(popoverId);
+    if (!button || !popover) return null;
+
+    const isOpen = () => !popover.hidden;
+    const close = ({ refocus = true } = {}) => {
+      if (!isOpen()) return;
+      popover.hidden = true;
+      button.setAttribute('aria-expanded', 'false');
+      if (refocus) button.focus();
+    };
+    const open = () => {
+      popover.hidden = false;
+      button.setAttribute('aria-expanded', 'true');
+      popover.querySelector(firstFieldSelector)?.focus();
+    };
+
+    button.addEventListener('click', (e) => {
+      e.stopPropagation();   // don't let the outside-click handler immediately re-close it
+      isOpen() ? close() : open();
+    });
+    popover.addEventListener('click', (e) => e.stopPropagation());
+    document.addEventListener('click', () => close({ refocus: false }));
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && isOpen()) close();
+    });
+    return { open, close, isOpen };
+  };
+
+  // ---------- New conversation (direct or group) ----------
+  // One popover for both, because from the user's side it is one intent: message these people.
+  // The split into two endpoints is ours, not theirs — one recipient is a direct message, more
+  // than one is a group. The name field only appears once it is a group, since that is the only
+  // case that needs one, and asking up front for a title most conversations never use is what
+  // made the old inline form feel like a chore.
+  //
+  // Wired here rather than in each page script because the channel and conversation pages carry
+  // the identical markup; two copies is how they drift.
+  const wireNewConversation = () => {
+    const form = document.getElementById('new-conversation-form');
+    if (!form) return;
+    const popover = wirePopover('sidebar-dm-btn', 'sidebar-dm-popover', 'input[name="members"]');
+
+    const membersInput = form.querySelector('input[name="members"]');
+    const titleLabel = form.querySelector('.new-conversation-title');
+    const titleInput = form.querySelector('input[name="title"]');
+    const hint = form.querySelector('#new-conversation-hint');
+    const submit = form.querySelector('#new-conversation-submit');
+
+    const names = () => (membersInput.value || '')
+        .split(/[,\s]+/).map((s) => s.trim()).filter(Boolean);
+
+    const syncMode = () => {
+      const isGroup = names().length > 1;
+      titleLabel.hidden = !isGroup;
+      submit.textContent = isGroup ? 'Create group' : 'Start';
+      hint.textContent = isGroup
+          ? 'A group needs a name.'
+          : 'One name starts a direct message. Add more to make a group.';
+    };
+    membersInput.addEventListener('input', syncMode);
+
+    const headers = csrfHeaders;
+
+    const fail = (msg) => {
+      hint.textContent = msg;
+      hint.classList.add('form-hint-error');
+      submit.disabled = false;
+    };
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      hint.classList.remove('form-hint-error');
+      const members = names();
+      if (!members.length) return;
+
+      const isGroup = members.length > 1;
+      const title = (titleInput.value || '').trim();
+      if (isGroup && !title) { fail('A group needs a name.'); titleInput.focus(); return; }
+
+      submit.disabled = true;
+      try {
+        const res = isGroup
+            ? await fetch('/api/conversations/group', {
+                method: 'POST', headers: headers(),
+                body: JSON.stringify({ title, members }),
+              })
+            : await fetch('/api/conversations/direct', {
+                method: 'POST', headers: headers(),
+                body: JSON.stringify({ username: members[0] }),
+              });
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          // The server reports unresolved names generically on purpose, so it can't be used
+          // as a username-existence oracle. Pass its wording through rather than inventing one.
+          fail(err.message || err.error || 'Could not start that conversation.');
+          return;
+        }
+        const dto = await res.json();
+        popover?.close({ refocus: false });
+        window.location.href = '/conversations/' + dto.id;
+      } catch (err) {
+        fail('Could not start that conversation.');
+      }
+    });
+  };
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', wireNewConversation);
+  } else {
+    wireNewConversation();
+  }
+
+  // ---------- Sidebar: direct-message unread badge ----------
+  /**
+   * Move a conversation's sidebar badge when one of its messages arrives.
+   *
+   * The server has always counted this correctly — the badge is right on every page load — but
+   * nothing moved it live, so a direct message to somebody sitting on another page produced a
+   * toast that vanished and no lasting trace anywhere. If they missed the toast, they missed the
+   * message until they happened to reload. Worse for a *new* conversation, which had no sidebar
+   * row at all: the first message from someone you had never spoken to was invisible.
+   *
+   * Deliberately not gated on the notification level. A muted conversation still counts, exactly
+   * as a muted channel does — muting means "stop interrupting me", not "hide it from me". The
+   * level decides whether `MentionNotifications.show` runs; this runs either way.
+   *
+   * @param alert the `/user/queue/conversation-alerts` payload.
+   */
+  const bumpConversationUnread = (alert) => {
+    const list = document.getElementById('sidebar-dm-list');
+    if (!list || !alert || !alert.conversationId) return;
+    const id = String(alert.conversationId);
+
+    // Reading it right now is not unread. Same rule the channel side uses: the marker only moves
+    // for a *focused* tab, so a conversation open in a background window still counts.
+    const active = document.querySelector('meta[name="active-conversation-id"]')?.content;
+    if (active && String(active) === id
+        && document.visibilityState === 'visible' && document.hasFocus()) {
+      return;
+    }
+
+    // Past that check the message is unread, which is exactly when the tab icon has something to
+    // say. Here rather than in MentionNotifications.show for the same reason the badge below is:
+    // show() is gated on Do Not Disturb, and DND silences interruptions, not unread markers.
+    window.FaviconAlert?.pulse();
+
+    const esc = (window.CSS && CSS.escape) ? CSS.escape(id) : id;
+    let li = list.querySelector('li[data-conv-id="' + esc + '"]');
+    if (!li) {
+      // A conversation that did not exist when this page was rendered. Build the row the same
+      // shape the server writes, so a reload changes nothing about it.
+      list.querySelector('li.dm-empty')?.remove();
+      li = document.createElement('li');
+      li.dataset.convId = id;
+      li.dataset.convType = alert.type || 'DIRECT';
+      const a = document.createElement('a');
+      a.href = '/conversations/' + id;
+      a.appendChild(buildAvatarEl({
+        username: alert.authorUsername || '',
+        letter: ((alert.title || alert.author || '?').charAt(0) || '?').toUpperCase(),
+      }));
+      const name = document.createElement('span');
+      name.className = 'dm-name';
+      name.textContent = alert.title || alert.author || '';
+      a.appendChild(name);
+      li.appendChild(a);
+      list.insertBefore(li, list.firstChild);
+    }
+
+    const link = li.querySelector('a');
+    if (!link) return;
+    let badge = link.querySelector('.unread-badge');
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.className = 'unread-badge';
+      badge.textContent = '0';
+      link.appendChild(badge);
+    }
+    // "99+" is a ceiling, not a number — once it is showing, stop counting rather than parsing it
+    // back to 99 and creeping upwards from there.
+    const shown = badge.textContent.trim();
+    if (shown !== '99+') {
+      const next = (parseInt(shown, 10) || 0) + 1;
+      badge.textContent = next > 99 ? '99+' : String(next);
+    }
+    li.classList.add('has-unread');
+  };
+
+  // ---------- Public surface ----------
+  window.ChatKit = {
+    bumpConversationUnread,
+    wirePopover,
+    buildThreadIndicator,
+    applyThreadIndicator,
+    createThreadPanel,
+    createTypingTracker,
+    throttledPing,
+    applyUnreadDivider,
+    wireAttachmentViewer,
+    buildRemovedAttachmentEl,
+    buildAttachmentEl,
+    buildAttachmentTray,
+    upgradeVideoCards,
+    buildLinkPreviewEl,
+    buildVideoFacadeEl,
+    applyLinkPreview,
+    hashCode,
+    avatarColor,
+    backfillAvatarColors,
+    buildAvatarEl,
+    dayKey,
+    formatTime,
+    formatBytes,
+    uploadWithProgress,
+    buildUploadChip,
+    wireFileDrop,
+    setUploadStatus,
+    skippedFoldersText,
+    insertAtCursor,
+    applyFormat,
+    wireFormatToolbar,
+    wireAllFormatToolbars,
+    wireAutoResize,
+    wireLivePreview,
+    wirePasteMarkdown,
+    wirePasteFiles,
+    // Exposed for the smoke tests, which can build a DataTransfer but not a real paste.
+    pastedFiles,
+    // Exposed for the in-browser smoke tests: the guard and clamp are pure enough to
+    // assert without a clipboard.
+    pasteWorthConverting,
+    insertPasteText,
+    openEmojiPicker,
+    closeEmojiPicker,
+    REACTION_PICKER_EMOJI,
+    // Exposed so the picker's shortcut list can be inspected without opening a picker — the
+    // in-browser smoke runner asserts on it, and a console is the only place anybody would ever
+    // want to clear it.
+    emojiRecents: { read: readRecentEmoji, remember: rememberEmoji, max: RECENT_EMOJI_MAX },
+    appendAuthorHandle,
+    setQuickReaction,
+    highlightCode,
+    renderDiagrams,
+    renderMessageBody,
+    buildMessageBodyEl,
+  };
+})();

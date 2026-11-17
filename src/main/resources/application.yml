@@ -1,0 +1,281 @@
+spring:
+  application:
+    name: threadforge
+
+  threads:
+    virtual:
+      enabled: true
+
+  datasource:
+    url: ${TFORGE_DB_URL:jdbc:postgresql://localhost:5432/threadforge_db}
+    username: ${TFORGE_DB_USERNAME:tforge_role}
+    password: ${TFORGE_DB_PASSWORD:tforge_role}
+    # Optional read replica: see tforge.datasource.replica below.
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: UTC
+        format_sql: false
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            client-id: ${KEYCLOAK_CLIENT_ID:tforge-client}
+            # No default — operators MUST supply the secret via env (or Vault). The previous
+            # default was the dev secret baked into keycloak/realm.json; if that string ever
+            # leaves the repo it becomes a credential. For local dev, export it from realm.json:
+            #   export KEYCLOAK_CLIENT_SECRET=$(jq -r '.clients[] | select(.clientId=="tforge-client") | .secret' keycloak/realm.json)
+            client-secret: ${KEYCLOAK_CLIENT_SECRET:}
+            scope: openid,profile,email
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+            client-name: Keycloak
+        provider:
+          keycloak:
+            # Default points at a localhost-bound Keycloak. Local-dev with the bundled
+            # docker-compose stack (Keycloak bound to a LAN IP) overrides this in
+            # application-dev.properties. Production sets KEYCLOAK_ISSUER_URI explicitly.
+            issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8081/realms/tforge-realm}
+            user-name-attribute: preferred_username
+      resourceserver:
+        jwt:
+          issuer-uri: ${KEYCLOAK_ISSUER_URI:http://localhost:8081/realms/tforge-realm}
+
+  thymeleaf:
+    cache: false
+
+server:
+  port: ${SERVER_PORT:8080}
+  # Default binds localhost only — safe for any environment, including a misconfigured
+  # production deploy that forgot to set SERVER_ADDRESS. The dev profile overrides this
+  # to the maintainer's LAN IP so phones / other devices can reach the app during
+  # mobile-layout testing.
+  address: ${SERVER_ADDRESS:127.0.0.1}
+  forward-headers-strategy: framework
+  servlet:
+    session:
+      # Match Keycloak's SSO Session Idle (8h). Keycloak is the authoritative
+      # session lifetime — change it there (Realm settings → Sessions) and bump
+      # this to match if you want them to expire together.
+      timeout: 8h
+      # JSESSIONID Secure flag is auto-detected per request via Tomcat (it ORs
+      # SessionCookieConfig.isSecure() with request.isSecure()). With
+      # forward-headers-strategy: framework (above), an X-Forwarded-Proto: https
+      # request is treated as secure and the cookie is marked Secure automatically.
+      # SameSite is set programmatically via SecurityConfig.sessionCookieSameSite.
+
+tforge:
+  # JS/CSS asset bundles (assets.gradle / ASSETS.md). Default (false) serves the minified,
+  # hash-versioned bundles built by `buildAssets`. The dev profile flips this to true to serve
+  # the original source files — edit + refresh, no rebuild.
+  assets:
+    unbundled: ${TFORGE_ASSETS_UNBUNDLED:false}
+
+  # Optional second connection pool against a Postgres read replica (ReadReplicaDataSourceConfig).
+  # Off by default, and off means genuinely absent — no proxy, no second pool, nothing to go wrong.
+  #
+  # When enabled, a transaction annotated @Transactional(readOnly = true) is served from the
+  # replica; writes, migrations and raw JDBC access stay on the primary. That is the whole routing
+  # rule, and there is no per-query annotation. Note that a Spring Data repository call made
+  # outside a transaction counts as read-only — SimpleJpaRepository declares it — so it goes to
+  # the replica too.
+  #
+  # What it buys and what it costs: the primary stops serving the channel history, search result
+  # hydration and sidebar reads that make up most of the query volume, which is the relief worth
+  # having on a busy instance. The cost is that a replica lags, so a read-only transaction can see
+  # a slightly older world than the write that just returned. That is fine for reading history and
+  # wrong for a read that decides to delete something — the Lucene reconcile sweeps use a plain
+  # @Transactional for exactly that reason. Keep new code on the same rule.
+  #
+  # username/password are optional: blank inherits spring.datasource.*, which is what a streaming
+  # replica normally wants. Size the pool with tforge.datasource.replica.hikari.* (Boot's usual
+  # Hikari keys) — the read pool is generally the one that wants to be larger.
+  #
+  # All four keys can equally come from Vault as db.replica-enabled / db.replica-url /
+  # db.replica-username / db.replica-password.
+  datasource:
+    replica:
+      enabled: ${TFORGE_DB_REPLICA_ENABLED:false}
+      url: ${TFORGE_DB_REPLICA_URL:}
+      username: ${TFORGE_DB_REPLICA_USERNAME:}
+      password: ${TFORGE_DB_REPLICA_PASSWORD:}
+
+  attachments:
+    dir: ${TFORGE_ATTACHMENTS_DIR:./data/attachments}
+    # Default total an account may store, in bytes (2 GiB). A per-account override lives in
+    # user_storage.quota_bytes; negative here (or there) means unlimited. Admins are exempt —
+    # see StorageQuotaService for why.
+    #
+    # This is a *total*, not a per-file limit: there is no cap on how large one upload may be, so
+    # the largest file an ordinary account can send is whatever is left of this allowance. Raise it
+    # (or clear a specific account's quota in the admin console) for people who need to move
+    # something big.
+    #
+    # This is not what keeps the volume from filling: a filesystem quota on the attachments
+    # dataset is. This is what keeps one account from spending everybody else's share first.
+    user-quota-bytes: ${TFORGE_USER_QUOTA_BYTES:2147483648}
+    # Refuse uploads while the attachments filesystem has less than this free (64 MiB), so the
+    # last of the disk is left for Postgres and for Lucene segment merges rather than spent on
+    # one more attachment. Raise it if the Lucene index shares the volume — a merge transiently
+    # needs room for a second copy of the segments it is merging. Zero disables the check.
+    min-free-bytes: ${TFORGE_MIN_FREE_BYTES:67108864}
+  avatars:
+    dir: ${TFORGE_AVATARS_DIR:./data/avatars}
+  branding:
+    dir: ${TFORGE_BRANDING_DIR:./data/branding}
+
+  # 1:1 audio and video calls (WebRTC). OFF until turn-urls and turn-secret are both set — see
+  # CallProperties. The app is not in the media path at any point: it relays SDP and ICE candidates
+  # over the existing WebSocket and the audio/video itself goes through coturn, which forwards
+  # encrypted UDP without being able to read it.
+  #
+  # Sizing, since this is the one feature that does not fit the README's 900 MB / one-core box: a
+  # relayed 1:1 audio call costs the relay ~128 kbps and a video call ~4 Mbps, counting both
+  # directions. Bandwidth binds long after coturn's packet-rate CPU does.
+  calls:
+    enabled: ${TFORGE_CALLS_ENABLED:true}
+    # e.g. turn:chat.example.com:3478?transport=udp,turns:chat.example.com:5349?transport=tcp
+    # Configure BOTH. The UDP entry is the fast path; the TURNS entry on a TLS port is the one that
+    # survives a corporate firewall, because on the wire it is indistinguishable from HTTPS.
+    turn-urls: ${TFORGE_TURN_URLS:}
+    # Must equal coturn's `static-auth-secret`. No default: a guessable secret is an open relay,
+    # and the bandwidth it gives away is yours.
+    turn-secret: ${TFORGE_TURN_SECRET:}
+    stun-urls: ${TFORGE_STUN_URLS:}
+    credential-ttl: ${TFORGE_TURN_CREDENTIAL_TTL:10m}
+    # Relay every call rather than letting peers connect directly. Costs bandwidth and buys two
+    # things: uniform behaviour (calls do not work for most people and fail behind hostile NATs),
+    # and neither participant learning the other's IP address. Set false to allow direct
+    # connections where they work, with the relay as fallback.
+    force-relay: ${TFORGE_CALLS_FORCE_RELAY:true}
+    video: ${TFORGE_CALLS_VIDEO:true}
+    ring-timeout: ${TFORGE_CALLS_RING_TIMEOUT:45s}
+
+  # Fallback timezone for users whose zone we don't know: no choice saved on the profile page and
+  # no `zoneinfo` claim from the identity provider. It decides what "/remind me at 09:00" means,
+  # so on a server in a different zone from its users this is worth setting to where the people
+  # are. Empty (the default) means the JVM's own zone, which is the behaviour that predates
+  # per-user zones.
+  default-zone: ${TFORGE_DEFAULT_ZONE:}
+
+  # Identity. Accounts are keyed on the OIDC subject, which the identity provider promises not to
+  # change for a person — per realm. Move the app to a dedicated Keycloak realm with the old one
+  # brokered in as an identity provider, and everyone arrives with a new subject and their old
+  # email. With this on (the default) a never-seen subject whose email is VERIFIED and matches
+  # exactly one existing account re-keys that account instead of creating a second one; the
+  # history stays where it was. Unverified emails never link, and neither does an email two
+  # accounts already share. Turn it off where an address can be reassigned to a different person
+  # and must not inherit the previous holder's account.
+  identity:
+    link-by-verified-email: ${TFORGE_IDENTITY_LINK_BY_VERIFIED_EMAIL:true}
+
+  # Link previews: the card (title, description, site, picture) under a message that contains a
+  # URL. The server fetches the page once the message is durable, on a small pool of its own, and
+  # keeps one row per URL so the tenth person to paste an article costs no fetch. Every fetch —
+  # page, redirect hop, image — is refused for private, loopback, link-local and similar addresses
+  # (OutboundUrlGuard); this is what makes "paste a link" safe to have. The picture is copied to
+  # `dir` and served from this origin, never hotlinked (the CSP forbids it, and it would leak every
+  # reader's address to every linked site).
+  #   max-html-bytes      how far into a page we will read looking for its head. The read stops at
+  #                       </head>, so on a well-formed page this is never reached — it is the
+  #                       backstop for one that never closes a head, and it is generous because
+  #                       cutting a page short costs a card: YouTube puts ~700 KB of script before
+  #                       its <title>, and a cut above that is a card with nothing in it
+  #   refresh-after       a good card is re-fetched when a new message posts the URL after this long
+  #   retry-failed-after  a page that failed or had nothing is not tried again before this
+  #   retention           rows nobody has posted in this long are purged, images included
+  #   threads / queue-capacity   the whole outbound budget; past the queue a card is dropped, the
+  #                              message is not
+  link-previews:
+    enabled: ${TFORGE_LINK_PREVIEWS_ENABLED:true}
+    dir: ${TFORGE_LINK_PREVIEWS_DIR:./data/link-previews}
+    max-html-bytes: ${TFORGE_LINK_PREVIEWS_MAX_HTML_BYTES:10485760}
+    max-image-bytes: ${TFORGE_LINK_PREVIEWS_MAX_IMAGE_BYTES:3145728}
+    timeout: ${TFORGE_LINK_PREVIEWS_TIMEOUT:6s}
+    refresh-after: ${TFORGE_LINK_PREVIEWS_REFRESH_AFTER:7d}
+    retry-failed-after: ${TFORGE_LINK_PREVIEWS_RETRY_FAILED_AFTER:1h}
+    retention: ${TFORGE_LINK_PREVIEWS_RETENTION:180d}
+    threads: ${TFORGE_LINK_PREVIEWS_THREADS:2}
+    queue-capacity: ${TFORGE_LINK_PREVIEWS_QUEUE_CAPACITY:500}
+
+  # One-time secrets (/secrets, links under /s/). The browser encrypts a secret before it leaves;
+  # the server stores ciphertext it has no key for and releases it once, to whoever presents the
+  # verifier derived from the link's key. Who may open a secret without an account is an admin
+  # setting (/admin), not a property.
+  #   max-plaintext-bytes   largest secret, in UTF-8 bytes, before encryption
+  #   max-waiting-per-user  how many unopened, unexpired secrets one account may hold at once
+  #   display-seconds       how long a revealed secret stays on screen; 1–300, and a larger value
+  #                         fails at startup — five minutes is a ceiling, not a default
+  #   lifetimes             the choices offered for how long an unopened link lives
+  #   default-lifetime      which of them is preselected; must be one of `lifetimes`
+  #   retention             how long an ended secret's row — its receipt, including an anonymous
+  #                         opener's IP address and browser summary — is kept before deletion
+  #   sweep-ms              how often expired ciphertext is forgotten and old rows are deleted
+  secrets:
+    max-plaintext-bytes: ${TFORGE_SECRETS_MAX_PLAINTEXT_BYTES:16384}
+    max-waiting-per-user: ${TFORGE_SECRETS_MAX_WAITING_PER_USER:50}
+    display-seconds: ${TFORGE_SECRETS_DISPLAY_SECONDS:300}
+    lifetimes: ${TFORGE_SECRETS_LIFETIMES:1h,1d,7d}
+    default-lifetime: ${TFORGE_SECRETS_DEFAULT_LIFETIME:1d}
+    retention: ${TFORGE_SECRETS_RETENTION:30d}
+    sweep-ms: ${TFORGE_SECRETS_SWEEP_MS:300000}
+
+  # Moderation. An admin removing messages is a SOFT delete: the rows stay, drop out of every
+  # read path, and stay recoverable until the retention window passes — the first ban is
+  # sometimes the wrong ban. RetentionPurgeScheduler then hard-deletes them for good.
+  #
+  #   retention-days   how long a removed message stays recoverable. 0 (or negative) keeps
+  #                    removed messages forever, which disables the purge.
+  #   purge-enabled    master switch. @EnableScheduling runs on every node, so set this false
+  #                    on all but one when running more than a single instance.
+  #   purge-max-batches * purge-batch-size caps how much one sweep will remove; a bigger
+  #                    backlog is carried to the next run rather than sat through in one
+  #                    long transaction.
+  moderation:
+    retention-days: ${TFORGE_RETENTION_DAYS:30}
+    purge-enabled: ${TFORGE_PURGE_ENABLED:true}
+    purge-interval-ms: ${TFORGE_PURGE_INTERVAL_MS:3600000}
+    purge-batch-size: 500
+    purge-max-batches: 200
+
+  # Optional Vault / OpenBao secret backend. Off by default — the env-var → application.yml
+  # default chain handles credentials. When enabled=true, VaultEnvironmentPostProcessor reads
+  # the KV-v2 record at ${path} (<mount>/<key>, or a bare key under secret/) and overrides
+  # spring.datasource.* + spring.security.oauth2.* before the auto-configurations consume them.
+  #
+  # Vault record shape (KV-v2 fields, each optional):
+  #   db.url / db.username / db.password              - Postgres connection
+  #   db.replica-enabled / -url / -username / -password - optional read replica
+  #   keycloak.client-id / keycloak.client-secret       - OIDC client
+  #   keycloak.issuer-uri                              - realm URL (client + resource server)
+  #
+  # Exactly one credential: a token, or an AppRole (role-id + secret-id; either half may come from
+  # a file via the -file variant, which is how systemd LoadCredential= hands a secret over). With
+  # AppRole the token is minted at boot, used for the single read and revoked; it never appears in
+  # the environment.
+  vault:
+    enabled: ${TFORGE_VAULT_ENABLED:false}
+    uri: ${TFORGE_VAULT_URI:}
+    path: ${TFORGE_VAULT_PATH:threadforge}
+    token: ${TFORGE_VAULT_TOKEN:}
+    role-id: ${TFORGE_VAULT_ROLE_ID:}
+    role-id-file: ${TFORGE_VAULT_ROLE_ID_FILE:}
+    secret-id: ${TFORGE_VAULT_SECRET_ID:}
+    secret-id-file: ${TFORGE_VAULT_SECRET_ID_FILE:}
+    approle-path: ${TFORGE_VAULT_APPROLE_PATH:approle}
+
+logging:
+  level:
+    org.springframework.security: INFO
+    org.hibernate.SQL: WARN

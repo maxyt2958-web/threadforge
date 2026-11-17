@@ -1,0 +1,5 @@
+spring:
+  main.web-application-type: none
+
+sharing.tasks.max: 6
+socket.timeout.seconds: 60

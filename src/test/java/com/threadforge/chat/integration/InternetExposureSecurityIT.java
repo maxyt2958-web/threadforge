@@ -1,0 +1,515 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.threadforge.chat.integration;
+
+import com.threadforge.chat.attachments.AttachmentBytes;
+import com.threadforge.chat.config.SecurityConfig;
+import com.threadforge.chat.domain.ChannelType;
+import com.threadforge.chat.domain.User;
+import com.threadforge.chat.repository.UserRepository;
+import com.threadforge.chat.security.CurrentUser;
+import com.threadforge.chat.security.RateLimitExceededException;
+import com.threadforge.chat.security.RateLimiter;
+import com.threadforge.chat.security.UploadTooLargeException;
+import com.threadforge.chat.service.AttachmentService;
+import com.threadforge.chat.service.ChannelService;
+import com.threadforge.chat.service.ConversationAttachmentService;
+import com.threadforge.chat.service.ConversationService;
+import com.threadforge.chat.service.MarkdownRenderer;
+import com.threadforge.chat.service.MentionService;
+import com.threadforge.chat.service.MessageService;
+import com.threadforge.chat.service.SearchService;
+import com.threadforge.chat.service.UserService;
+import com.threadforge.chat.web.AttachmentRestController;
+import com.threadforge.chat.web.UserRestController;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.mock.web.MockHttpServletRequest;
+import org.springframework.mock.web.MockHttpServletResponse;
+import org.springframework.mock.web.MockHttpSession;
+import org.springframework.security.authentication.TestingAuthenticationToken;
+import org.springframework.security.core.context.SecurityContextHolder;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
+import org.springframework.security.web.savedrequest.RequestCache;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import java.io.ByteArrayInputStream;
+import java.security.Principal;
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * Locks in the security boundaries that exist specifically because the app is exposed
+ * on the public internet — anything an authenticated attacker (or one who briefly
+ * obtains a single valid session) might try to exploit.
+ *
+ * <p>Companion to {@code SecurityBoundaryIT}; that file covers the auth/authz invariants
+ * the codebase has always asserted. This file covers the additions made for internet
+ * exposure: per-user upload caps via Keycloak claim, GET rate limits against
+ * enumeration / bandwidth DoS, Lucene wildcard refusal.
+ */
+@Testcontainers
+@SpringBootTest(
+        classes = IntegrationTestApplication.class,
+        webEnvironment = SpringBootTest.WebEnvironment.NONE
+)
+class InternetExposureSecurityIT {
+
+    @Container
+    @SuppressWarnings("resource")
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:18-alpine")
+            .withDatabaseName("chat")
+            .withUsername("chat")
+            .withPassword("chat");
+
+    @DynamicPropertySource
+    static void datasource(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.flyway.enabled", () -> "true");
+        registry.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+        TestLuceneDirs.register(registry);
+    }
+
+    @Autowired UserRepository users;
+    @Autowired UserService userService;
+    @Autowired ChannelService channels;
+    @Autowired MessageService messages;
+    @Autowired AttachmentService attachments;
+    @Autowired ConversationService conversations;
+    @Autowired ConversationAttachmentService convAttachments;
+    @Autowired MarkdownRenderer markdown;
+    @Autowired SearchService search;
+    @Autowired MentionService mentionService;
+
+    private CurrentUser currentUser;
+    private SimpMessagingTemplate broker;
+    private RateLimiter rateLimiter;
+
+    private static final AtomicInteger SEQ = new AtomicInteger();
+
+    @BeforeEach
+    void wire() {
+        currentUser = mock(CurrentUser.class);
+        broker = mock(SimpMessagingTemplate.class);
+        rateLimiter = new RateLimiter();
+    }
+
+    @AfterEach
+    void clearAuth() {
+        SecurityContextHolder.clearContext();
+    }
+
+    private User newUser(String prefix) {
+        var i = SEQ.incrementAndGet();
+        return users.save(new User("kc-int-" + prefix + i, prefix + "-" + i,
+                prefix + i + "@e", prefix + " " + i));
+    }
+
+    // ---------- Per-user upload cap (Keycloak claim) ----------
+
+    /**
+     * No per-file cap unless an operator asks for one. The default was 50 MiB, which is under the
+     * size of a screen recording or a database dump — the two things people most often need to
+     * hand over — and the cap bought nothing the rest of the design does not already provide:
+     * uploads stream to disk rather than through memory, a per-account storage quota bounds the
+     * total, and a free-space floor protects the volume. A ceiling is still available per user
+     * through the {@code chat_max_upload_bytes} claim, which is where a policy belongs.
+     */
+    @Test
+    void uploadCap_isUnlimited_whenNoClaim() {
+        // OIDC/JWT not present in the test principal → CurrentUser falls back to default.
+        var bareCurrent = new CurrentUser(userService, users);
+        var dummy = new TestingAuthenticationToken("anon", "n/a", "ROLE_USER");
+        dummy.setAuthenticated(true);
+
+        assertThat(bareCurrent.uploadCapBytes(dummy)).isEqualTo(AttachmentBytes.UNLIMITED);
+    }
+
+    /** An explicit claim is still honoured — the cap is opt-in, not gone. */
+    @Test
+    void uploadCap_honoursAnExplicitClaim() {
+        var bareCurrent = new CurrentUser(userService, users);
+        var jwt = org.springframework.security.oauth2.jwt.Jwt.withTokenValue("t")
+                .header("alg", "none")
+                .claim("sub", "cap-subject")
+                .claim("preferred_username", "capped")
+                .claim("chat_max_upload_bytes", 1048576L)
+                .build();
+        var auth = new org.springframework.security.oauth2.server.resource.authentication
+                .JwtAuthenticationToken(jwt, java.util.List.of());
+
+        assertThat(bareCurrent.uploadCapBytes(auth)).isEqualTo(1048576L);
+    }
+
+    @Test
+    void uploadCap_admin_isUnlimited() {
+        var bareCurrent = new CurrentUser(userService, users);
+        var admin = new TestingAuthenticationToken("admin", "n/a", "ROLE_ADMIN");
+        admin.setAuthenticated(true);
+
+        assertThat(bareCurrent.uploadCapBytes(admin)).isEqualTo(AttachmentBytes.UNLIMITED);
+    }
+
+    @Test
+    void uploadCap_jwtClaim_overridesDefault() {
+        var bareCurrent = new CurrentUser(userService, users);
+        var jwt = Jwt.withTokenValue("token")
+                .header("alg", "none")
+                .issuedAt(Instant.now()).expiresAt(Instant.now().plusSeconds(60))
+                .subject("kc-foo")
+                .claim("preferred_username", "foo")
+                .claim("chat_max_upload_bytes", 200L * 1024 * 1024)  // 200 MiB
+                .build();
+        var auth = new JwtAuthenticationToken(jwt);
+
+        assertThat(bareCurrent.uploadCapBytes(auth)).isEqualTo(200L * 1024 * 1024);
+    }
+
+    @Test
+    void uploadCap_jwtClaimAsString_alsoParses() {
+        // Keycloak serialises long claims as strings under some mapper configs — both must work.
+        var bareCurrent = new CurrentUser(userService, users);
+        var jwt = Jwt.withTokenValue("token")
+                .header("alg", "none")
+                .issuedAt(Instant.now()).expiresAt(Instant.now().plusSeconds(60))
+                .subject("kc-bar").claim("preferred_username", "bar")
+                .claim("chat_max_upload_bytes", "104857600")  // 100 MiB as string
+                .build();
+        var auth = new JwtAuthenticationToken(jwt);
+
+        assertThat(bareCurrent.uploadCapBytes(auth)).isEqualTo(100L * 1024 * 1024);
+    }
+
+    @Test
+    void channelUpload_oversizedUnderCap_throwsUploadTooLarge() {
+        var alice = newUser("alice");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        var smallCap = 1024L; // 1 KiB cap to keep the test fast
+
+        // Streaming throw: 4 KiB of bytes, cap at 1 KiB
+        var oversize = new java.io.ByteArrayInputStream(new byte[4096]);
+
+        assertThatThrownBy(() -> attachments.upload(
+                room, alice, "big.bin", "application/octet-stream", -1L, smallCap, "", oversize))
+                .isInstanceOf(UploadTooLargeException.class);
+    }
+
+    @Test
+    void channelUpload_declaredOversize_rejectedBeforeStreaming() {
+        var alice = newUser("alice");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        var cap = 1024L;
+        // Pretend the client says it's 5 KiB — service should refuse before reading the stream.
+        var anyStream = new java.io.ByteArrayInputStream(new byte[1]);
+
+        assertThatThrownBy(() -> attachments.upload(
+                room, alice, "claim.bin", "application/octet-stream", 5 * 1024L, cap, "", anyStream))
+                .isInstanceOf(UploadTooLargeException.class);
+    }
+
+    @Test
+    void dmUpload_oversizedUnderCap_throwsUploadTooLarge() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var conv = conversations.directBetween(alice, bob);
+        var smallCap = 1024L;
+        var oversize = new java.io.ByteArrayInputStream(new byte[4096]);
+
+        assertThatThrownBy(() -> convAttachments.upload(
+                conv, alice, "big.bin", "application/octet-stream", -1L, smallCap, "", oversize))
+                .isInstanceOf(UploadTooLargeException.class);
+    }
+
+    @Test
+    void uploadUnderCap_succeeds() throws Exception {
+        var alice = newUser("alice");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        var ok = attachments.upload(
+                room, alice, "small.txt", "text/plain", -1L, 1024L, "",
+                new ByteArrayInputStream("hi".getBytes()));
+        assertThat(ok.getId()).isNotNull();
+        assertThat(ok.getSizeBytes()).isEqualTo(2L);
+    }
+
+    // ---------- GET rate limits (anti-enumeration, anti-bandwidth-DoS) ----------
+
+    @Test
+    void userProfileLookup_isRateLimited() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        when(currentUser.resolve(any(Principal.class))).thenReturn(alice);
+        var controller = new UserRestController(userService, currentUser, rateLimiter,
+                channels, conversations, mentionService);
+
+        // 120/min is the configured cap. Hammer past it and assert the 121st throws.
+        for (int i = 0; i < 120; i++) {
+            controller.profile(bob.getUsername(), mock(Principal.class));
+        }
+        assertThatThrownBy(() -> controller.profile(bob.getUsername(), mock(Principal.class)))
+                .isInstanceOf(RateLimitExceededException.class);
+    }
+
+    @Test
+    void userProfileLookup_perUserKeysAreIndependent() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var carol = newUser("carol");
+        var controller = new UserRestController(userService, currentUser, rateLimiter,
+                channels, conversations, mentionService);
+
+        // Alice exhausts her quota looking up carol.
+        when(currentUser.resolve(any(Principal.class))).thenReturn(alice);
+        for (int i = 0; i < 120; i++) {
+            controller.profile(carol.getUsername(), mock(Principal.class));
+        }
+        // Bob's quota is unaffected — different rate-limit key.
+        when(currentUser.resolve(any(Principal.class))).thenReturn(bob);
+        controller.profile(carol.getUsername(), mock(Principal.class)); // no throw
+    }
+
+    /**
+     * The @-mention typeahead answers prefix queries, so an unbounded one is a name-enumeration
+     * tool. Its budget is its own action (a typeahead would drain the 20/min {@code user-lookup}
+     * budget mid-sentence) but it is still a budget.
+     */
+    @Test
+    void mentionCandidates_isRateLimited() {
+        var alice = newUser("alice");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        when(currentUser.resolve(any(Principal.class))).thenReturn(alice);
+        var controller = new UserRestController(userService, currentUser, rateLimiter,
+                channels, conversations, mentionService);
+
+        for (int i = 0; i < 120; i++) {
+            controller.mentionCandidates(room.getId(), null, "ali", 8, mock(Principal.class));
+        }
+        assertThatThrownBy(() ->
+                controller.mentionCandidates(room.getId(), null, "ali", 8, mock(Principal.class)))
+                .isInstanceOf(RateLimitExceededException.class);
+    }
+
+    // ---------- Lucene wildcard refusal ----------
+
+    @Test
+    void search_userSuppliedWildcard_returnsNoResultsWithoutFanout() {
+        var alice = newUser("alice");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        // Plant several distinct terms so a runaway `*` would otherwise match many.
+        messages.post(room, alice, "alpha");
+        messages.post(room, alice, "alphabet");
+        messages.post(room, alice, "altitude");
+        messages.post(room, alice, "anything");
+
+        // Authenticate alice for SearchService's authorization checks.
+        var auth = new TestingAuthenticationToken(alice.getUsername(), "n/a", "ROLE_USER");
+        auth.setAuthenticated(true);
+        SecurityContextHolder.getContext().setAuthentication(auth);
+
+        // Trailing wildcard — would be a TermsEnumeration in stock Lucene QueryParser.
+        var hits = search.searchChannel(room, alice, "a*", 50);
+        // Refused at the parser level → no results, no DoS.
+        assertThat(hits).isEmpty();
+
+        // Also reject naked-prefix and regex syntax.
+        assertThat(search.searchChannel(room, alice, "alph?", 50)).isEmpty();
+        assertThat(search.searchChannel(room, alice, "/al.+/", 50)).isEmpty();
+    }
+
+    @Test
+    void search_normalQueryStillWorks() {
+        var alice = newUser("alice");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        messages.post(room, alice, "the quick brown fox");
+
+        var auth = new TestingAuthenticationToken(alice.getUsername(), "n/a", "ROLE_USER");
+        auth.setAuthenticated(true);
+        SecurityContextHolder.getContext().setAuthentication(auth);
+
+        var hits = search.searchChannel(room, alice, "brown", 10);
+        assertThat(hits).hasSize(1);
+    }
+
+    // ---------- Post-login redirect (a permalink must survive the login round-trip) ----------
+    //
+    // The web chain sends an unauthenticated browser to Keycloak and brings it back. Where it
+    // lands is the one place in this application where a URL decides where a user goes, which
+    // makes it the one place an open redirect could live. These exercise the real wiring —
+    // SecurityConfig.loginRequestCache() and SecurityConfig.loginSuccessHandler() are the same
+    // static factories webFilterChain calls — against mock requests, so no Keycloak is needed to
+    // assert what the Location header comes out as.
+
+    /** The saved-request store and the handler that reads it, wired the way the web chain wires them. */
+    private record LoginRoundTrip(RequestCache cache,
+                                  org.springframework.security.web.authentication.AuthenticationSuccessHandler handler,
+                                  MockHttpSession session) {
+
+        static LoginRoundTrip start() {
+            var cache = SecurityConfig.loginRequestCache();
+            return new LoginRoundTrip(cache, SecurityConfig.loginSuccessHandler(cache),
+                    new MockHttpSession());
+        }
+
+        /** A signed-out browser asks for {@code path}; the chain refuses and saves the request. */
+        void refuse(MockHttpServletRequest wanted) {
+            wanted.setSession(session);
+            cache.saveRequest(wanted, new MockHttpServletResponse());
+        }
+
+        /** …and comes back from Keycloak. Returns the Location the browser is sent to. */
+        String landing() throws Exception {
+            var callback = new MockHttpServletRequest("GET", "/login/oauth2/code/keycloak");
+            callback.setSession(session);
+            var response = new MockHttpServletResponse();
+            var auth = new TestingAuthenticationToken("alice", "n/a", "ROLE_USER");
+            auth.setAuthenticated(true);
+            handler.onAuthenticationSuccess(callback, response, auth);
+            return response.getRedirectedUrl();
+        }
+    }
+
+    /** A page request of the shape a browser actually makes. */
+    private static MockHttpServletRequest pageRequest(String path, String query) {
+        var request = new MockHttpServletRequest("GET", path);
+        request.setQueryString(query);
+        request.addHeader("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+        return request;
+    }
+
+    @Test
+    void loginRedirect_returnsToThePermalinkThatTriggeredIt() throws Exception {
+        // The whole point: /channels/2?m=1234 is what "Copy link to message" produces, and it has
+        // to be where you end up, not where you were going before the welcome page swallowed it.
+        var trip = LoginRoundTrip.start();
+        trip.refuse(pageRequest("/channels/2", "m=1234"));
+
+        assertThat(trip.landing()).isEqualTo("/channels/2?m=1234");
+    }
+
+    @Test
+    void loginRedirect_withNothingSaved_landsOnChannels() throws Exception {
+        // Signing in from the landing page still goes where it always went.
+        assertThat(LoginRoundTrip.start().landing()).isEqualTo("/channels");
+    }
+
+    @Test
+    void loginRedirect_ignoresRedirectTargetsNamedInTheCallback() throws Exception {
+        // The open-redirect classic: an attacker gets the victim to start a login carrying a
+        // target of the attacker's choosing. Nothing here reads a URL out of a parameter, under
+        // any of the names that convention has attached to this idea.
+        var trip = LoginRoundTrip.start();
+        var callback = new MockHttpServletRequest("GET", "/login/oauth2/code/keycloak");
+        callback.setSession(trip.session());
+        callback.setParameter("continue", "https://evil.example/harvest");
+        callback.setParameter("redirect_uri", "https://evil.example/harvest");
+        callback.setParameter("next", "//evil.example/harvest");
+        callback.setParameter("url", "https://evil.example/harvest");
+        callback.addHeader("Referer", "https://evil.example/");
+        var response = new MockHttpServletResponse();
+        var auth = new TestingAuthenticationToken("alice", "n/a", "ROLE_USER");
+        auth.setAuthenticated(true);
+
+        trip.handler().onAuthenticationSuccess(callback, response, auth);
+
+        assertThat(response.getRedirectedUrl()).isEqualTo("/channels");
+    }
+
+    @Test
+    void loginRedirect_cannotBeSentOffSiteByTheHostHeader() throws Exception {
+        // A SavedRequest hands back an ABSOLUTE url built from the server's view of the request,
+        // Host header included — and ForwardedHeaderFilter takes that from X-Forwarded-Host with
+        // no trusted-proxy allowlist. The handler keeps the path and drops the origin, so even a
+        // saved request that claims to be for another host redirects within this one.
+        var trip = LoginRoundTrip.start();
+        var wanted = pageRequest("/channels/2", "m=1234");
+        wanted.setScheme("https");
+        wanted.setServerName("evil.example");
+        wanted.setServerPort(443);
+        trip.refuse(wanted);
+
+        var landing = trip.landing();
+        assertThat(landing).isEqualTo("/channels/2?m=1234");
+        assertThat(landing).doesNotContain("evil.example");
+    }
+
+    @Test
+    void loginRedirect_refusesAProtocolRelativeTarget() {
+        // "//evil.example/x" looks like a path and is read by every browser as another origin.
+        // Refused rather than repaired — there is no version of this that was meant.
+        assertThat(SecurityConfig.sameOriginTarget("https://chat.example//evil.example/x")).isNull();
+        assertThat(SecurityConfig.sameOriginTarget("//evil.example/x")).isNull();
+        assertThat(SecurityConfig.sameOriginTarget("https://chat.example/channels/2?m=1"))
+                .isEqualTo("/channels/2?m=1");
+    }
+
+    @Test
+    void loginRedirect_isNotHijackedByABackgroundApiCall() throws Exception {
+        // Browser calls to /api/** carry no bearer token, so they run on the WEB chain: an
+        // expired session turns a presence poll into a 302 and, without the exclusion, into the
+        // saved request that decides where the user's next real login lands. A page of JSON,
+        // chosen by whichever XHR lost the race.
+        var trip = LoginRoundTrip.start();
+        trip.refuse(new MockHttpServletRequest("GET", "/api/presence"));
+
+        assertThat(trip.landing()).isEqualTo("/channels");
+    }
+
+    @Test
+    void loginRedirect_isNotHijackedByTheWebSocketHandshake() throws Exception {
+        // Same reasoning as /api/**: an unauthenticated /ws handshake lands on the web chain too.
+        var trip = LoginRoundTrip.start();
+        trip.refuse(new MockHttpServletRequest("GET", "/ws"));
+
+        assertThat(trip.landing()).isEqualTo("/channels");
+    }
+
+    @Test
+    void loginRedirect_isNotHijackedBySubResourcesOrForms() throws Exception {
+        // /favicon.ico is NOT in the permitAll list, so it authenticates like any other request
+        // and would otherwise be a perfectly valid thing to resume. And a saved POST comes back
+        // as a redirect, which is a GET — the form is not re-submitted, it is silently dropped.
+        var favicon = LoginRoundTrip.start();
+        var iconRequest = new MockHttpServletRequest("GET", "/favicon.ico");
+        iconRequest.addHeader("Accept", "image/avif,image/webp,*/*");
+        favicon.refuse(iconRequest);
+        assertThat(favicon.landing()).isEqualTo("/channels");
+
+        var form = LoginRoundTrip.start();
+        var post = pageRequest("/channels/2", null);
+        post.setMethod("POST");
+        form.refuse(post);
+        assertThat(form.landing()).isEqualTo("/channels");
+    }
+}

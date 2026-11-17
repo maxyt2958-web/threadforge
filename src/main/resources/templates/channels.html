@@ -1,0 +1,677 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org" xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+    <meta name="theme-color" content="#18181b"/>
+    <title th:text="${activeChannel != null ? '#' + activeChannel.name + ' · ' + appTitle : appTitle}">ThreadForge</title>
+    <link rel="icon" th:href="${appFaviconUrl}"/>
+    <th:block th:replace="~{fragments/assets :: css('app')}"/>
+    <meta name="_csrf" th:content="${_csrf != null ? _csrf.token : ''}"/>
+    <meta name="_csrf_header" th:content="${_csrf != null ? _csrf.headerName : ''}"/>
+    <th:block th:replace="~{fragments/time-prefs :: metas}"/>
+    <!-- Workspace-admin flag (realm role tforge-admin -> ROLE_ADMIN); read by the avatar
+         dropdown to decide whether to offer the Admin console item. Distinct from the
+         channel-scoped me-is-admin meta on the chat pages. -->
+    <meta name="me-is-workspace-admin" sec:authorize="hasRole('ADMIN')" content="true"/>
+    <meta name="me-username" th:content="${me.username}"/>
+    <!--/* Account-wide notification default: ALL, MENTIONS or NONE — never DEFAULT.
+           A channel row resolves as data-notify-level == DEFAULT ? this : its own. */-->
+    <meta name="me-notify-default" th:content="${sidebar.notifyDefault}"/>
+    <meta name="me-display" th:content="${me.displayName}"/>
+    <!-- Read by the optimistic-send placeholder so the bubble it draws before the server
+         confirms carries the same avatar as the real message that replaces it. -->
+    <meta name="me-has-avatar" th:content="${me.hasAvatar() ? 'true' : 'false'}"/>
+    <meta name="me-avatar-version" th:content="${me.avatarVersion()}"/>
+    <!--/* The notification subscription set: every channel the viewer is a member of, as ids.
+           index.js opens one /topic/channels/{id} subscription per id in here.
+
+           It comes from SidebarView, NOT from the rendered sidebar, and that distinction is the
+           whole point. When the subscriptions were derived from the sidebar's <li> rows, a channel
+           outside the rendered shortlist produced no toast, no chime, no badge and no bell update
+           until the next page load — an @mention in it was simply lost. Any future change to how
+           the sidebar renders (a collapsed group, a virtualised list, a server-side filter) would
+           silently reintroduce that. Rendering is a view of the membership; this is the membership. */-->
+    <meta name="me-channel-ids" th:content="${sidebar.channelIds()}"/>
+    <meta name="active-channel-id" th:content="${activeChannelId}"/>
+    <meta name="centered-on-anchor" th:content="${centeredOnAnchor != null and centeredOnAnchor ? 'true' : 'false'}"/>
+    <meta name="anchor-message-id" th:content="${anchorMessageId}"/>
+    <meta name="me-is-admin" th:content="${isAdmin == true ? 'true' : 'false'}"/>
+    <!--/* May the viewer write here — the same condition the composer is rendered behind, named
+           once so the message action row does not have to infer it from the composer's presence.
+           Pinning is a write, so it is offered on exactly this flag; the server checks anyway. */-->
+    <meta name="me-can-write"
+          th:content="${activeChannel != null and isMember and !activeChannel.archived ? 'true' : 'false'}"/>
+    <!--/* Is this channel private — read by the forward dialog to decide whether to show the
+           disclosure warning. The server enforces the matching rule (MessageForwardService refuses
+           an unacknowledged forward out of a private channel); this only decides what the dialog
+           says before it asks. */-->
+    <meta name="active-channel-private"
+          th:content="${activeChannel != null and activeChannel.type.name() == 'PRIVATE' ? 'true' : 'false'}"/>
+</head>
+<body class="app" th:attr="data-theme=${me.theme}">
+
+<th:block th:replace="~{fragments/icon-sprite :: sprite}"/>
+
+<th:block th:replace="~{fragments/topbar :: topbar}"></th:block>
+
+<div class="layout">
+    <div id="sidebar-backdrop" class="sidebar-backdrop" hidden></div>
+    <th:block th:replace="~{fragments/sidebar :: sidebar}"></th:block>
+
+    <main class="content">
+        <div th:if="${activeChannel == null}" class="empty-state">
+            <h2>Welcome, <span th:text="${me.displayName ?: me.username}">user</span></h2>
+            <p>Pick a channel from the left, browse all of them, or create a new one.</p>
+
+            <details class="create-channel" open>
+                <summary>+ Create channel</summary>
+                <form id="create-channel-form" class="create-channel-form">
+                    <label>Name <input name="name" required maxlength="120"/></label>
+                    <label>Description <input name="description" maxlength="500"/></label>
+                    <label>Type
+                        <select name="type">
+                            <option value="PUBLIC">Public</option>
+                            <option value="PRIVATE">Private</option>
+                        </select>
+                    </label>
+                    <button type="submit">Create</button>
+                </form>
+            </details>
+        </div>
+
+        <div th:if="${activeChannel != null and !isMember and activeChannel.type.name() == 'PRIVATE'}"
+             class="empty-state">
+            <h2>#<span th:text="${activeChannel.name}">channel</span></h2>
+            <p>This is a private channel. Ask an admin for an invitation.</p>
+        </div>
+
+        <div th:if="${activeChannel != null and (isMember or activeChannel.type.name() == 'PUBLIC')}"
+             class="channel-view">
+
+            <div class="channel-header">
+                <div class="channel-header-info">
+                    <button th:if="${isMember}" type="button"
+                            id="channel-admin-cog"
+                            class="channel-cog"
+                            aria-haspopup="true" aria-expanded="false"
+                            aria-controls="channel-admin-dropdown"
+                            title="Channel settings" aria-label="Channel settings">
+                        <svg class="icon"><use href="#icon-cog"/></svg>
+                    </button>
+                    <h1>
+                        <span style="opacity:0.5">#</span><span id="channel-name"
+                              th:text="${activeChannel.name}">general</span>
+                    </h1>
+                    <!--/* Always rendered, hidden by .is-empty when there is nothing to say. A
+                           th:if here meant a channel that gained a description could not show it
+                           without a reload — there was no element for the live update to fill. */-->
+                    <span id="channel-purpose" class="channel-purpose"
+                          th:classappend="${activeChannel.description} ? '' : 'is-empty'"
+                          th:text="${activeChannel.description}">description</span>
+                    <!--/* Archived marker beside the name, so the state is legible from the one
+                           glance people give a header. The banner below says the rest. */-->
+                    <span id="channel-archived-chip" class="channel-archived-chip"
+                          th:classappend="${activeChannel.archived} ? '' : 'is-hidden'">
+                        <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-archive"/></svg>
+                        Archived
+                    </span>
+                </div>
+                <!--/* The "Search this channel…" box that used to sit here is gone. It was the
+                       third search input visible at once, each meaning something different, and
+                       the narrowest of the three did the thing people most often want. Searching
+                       this channel is now what the top bar already does while you are reading it:
+                       the box says "Search #general", and the results page it opens has the scope
+                       control for widening — plus in:#channel for naming a different one. */-->
+                <div class="channel-header-actions">
+                    <!--/* Pins live in the header because that is where a channel says what it is:
+                           the name, the purpose, and the handful of messages it wants read first.
+                           The count is filled by index.js from /api/channels/{id}/pins, the same
+                           way the members count is — one request, and its answer is also what the
+                           panel renders, so opening the panel costs nothing. */-->
+                    <button type="button" id="channel-pins-toggle" class="icon-btn is-hidden"
+                            aria-haspopup="true" aria-expanded="false"
+                            aria-controls="channel-pins-panel"
+                            title="Pinned messages" aria-label="Pinned messages">
+                        <svg class="icon"><use href="#icon-pin"/></svg>
+                        <span id="channel-pins-count">0</span>
+                    </button>
+                    <!--/* Files. A link, not a panel: name, uploader, size, date, the message it
+                           came from and a download is six columns, and six columns in a dropdown is
+                           a table nobody can read. It sits here rather than behind the cog because
+                           the cog is settings — it is only rendered for members, and browsing a
+                           public channel's files needs no membership at all. */-->
+                    <a th:href="@{'/channels/' + ${activeChannel.id} + '/files'}" class="icon-btn"
+                       title="Files shared in this channel" aria-label="Files shared in this channel">
+                        <svg class="icon"><use href="#icon-folder"/></svg>
+                    </a>
+                    <button type="button" id="channel-members-toggle" class="icon-btn"
+                            aria-haspopup="true" aria-expanded="false"
+                            aria-controls="channel-members-panel"
+                            title="Channel members" aria-label="Channel members">
+                        <svg class="icon"><use href="#icon-users"/></svg>
+                        <span id="channel-members-count">…</span>
+                    </button>
+                    <!--/* No Join on an archived channel: the server refuses it, and offering a
+                           button that cannot work is worse than offering none. Reading it is still
+                           allowed, which is the whole difference between archiving and deleting. */-->
+                    <button th:if="${activeChannel.type.name() == 'PUBLIC' and !isMember and !activeChannel.archived}"
+                            id="join-channel-btn" type="button"
+                            th:data-channel-id="${activeChannel.id}">Join channel</button>
+                </div>
+
+                <section id="channel-pins-panel"
+                         class="channel-admin-dropdown channel-pins-panel"
+                         role="dialog"
+                         aria-labelledby="channel-pins-title"
+                         hidden>
+                    <header>
+                        <h3 id="channel-pins-title">Pinned messages</h3>
+                        <button type="button" id="channel-pins-close" class="icon-btn" title="Close" aria-label="Close">
+                            <svg class="icon"><use href="#icon-close"/></svg>
+                        </button>
+                    </header>
+                    <ol class="channel-pins-list" id="channel-pins-list">
+                        <li class="dm-empty">Loading…</li>
+                    </ol>
+                </section>
+
+                <section id="channel-members-panel"
+                         class="channel-admin-dropdown"
+                         role="dialog"
+                         aria-labelledby="channel-members-title"
+                         hidden>
+                    <header>
+                        <h3 id="channel-members-title">Members</h3>
+                        <button type="button" id="channel-members-close" class="icon-btn" title="Close" aria-label="Close">
+    <svg class="icon"><use href="#icon-close"/></svg>
+</button>
+                    </header>
+                    <ul class="members members-cols" id="channel-members-list">
+                        <li class="dm-empty">Loading…</li>
+                    </ul>
+                </section>
+
+                <section th:if="${isMember}"
+                         id="channel-admin-dropdown"
+                         class="channel-admin-dropdown anchor-left"
+                         role="dialog"
+                         aria-labelledby="channel-admin-title"
+                         hidden>
+                    <header>
+                        <!--/* "Channel settings", not "Channel members": this panel started as a
+                               member list with an invite box and has since grown rename, the
+                               notification level, archive, delete and leave. The cog that opens it
+                               has said "Channel settings" all along, and a heading that names the
+                               smallest thing in the panel sends people looking elsewhere for the
+                               rest. The members list keeps its own heading further down. */-->
+                        <h3 id="channel-admin-title">Channel settings</h3>
+                        <button type="button" id="channel-admin-close" class="icon-btn" title="Close" aria-label="Close">
+    <svg class="icon"><use href="#icon-close"/></svg>
+</button>
+                    </header>
+                    <!--/* Rename / re-describe. Channel admins only — the server checks, this only
+                           decides whether to draw the controls. Both fields in one form because
+                           they are one thought ("what is this channel"), and because the endpoint
+                           takes them together: the name is required, so a PATCH that carried only a
+                           description would have to invent one.
+
+                           Wired from index.js: the CSP forbids inline handlers. */-->
+                    <form th:if="${isAdmin and !activeChannel.archived}" id="channel-rename-form"
+                          class="channel-rename"
+                          th:data-channel-id="${activeChannel.id}">
+                        <label for="channel-rename-name">Name</label>
+                        <input id="channel-rename-name" name="name" required maxlength="120"
+                               autocomplete="off" th:value="${activeChannel.name}"/>
+                        <label for="channel-rename-description">Description</label>
+                        <input id="channel-rename-description" name="description" maxlength="500"
+                               autocomplete="off" placeholder="What is this channel for?"
+                               th:value="${activeChannel.description}"/>
+                        <!--/* Said before the fact rather than after it: the address bar is
+                               id-based so no link breaks, but the name in a URL changing under
+                               someone is worth a sentence. */-->
+                        <p class="channel-rename-note">Renaming updates the channel's short name in
+                            links. Existing links keep working.</p>
+                        <div class="channel-rename-actions">
+                            <p class="channel-rename-status" id="channel-rename-status" hidden></p>
+                            <button type="submit" id="channel-rename-save">Save</button>
+                        </div>
+                    </form>
+
+                    <!--/* Per-channel notifications. "Default" is the top entry and the stored
+                           value, so changing the account setting moves this channel with it —
+                           the picker shows what it inherits rather than hiding the link. */-->
+                    <div class="channel-notify" th:if="${notifyLevel != null}">
+                        <label for="channel-notify-level">Notify me about</label>
+                        <select id="channel-notify-level"
+                                th:data-channel-id="${activeChannel.id}"
+                                th:data-current="${notifyLevel}">
+                            <option value="DEFAULT"
+                                    th:text="'Default (' + ${#strings.toLowerCase(notifyDefault)} + ')'"
+                                    th:selected="${notifyLevel.name() == 'DEFAULT'}">Default</option>
+                            <option value="ALL" th:selected="${notifyLevel.name() == 'ALL'}">Every message</option>
+                            <option value="MENTIONS" th:selected="${notifyLevel.name() == 'MENTIONS'}">Mentions only</option>
+                            <option value="NONE" th:selected="${notifyLevel.name() == 'NONE'}">Nothing (mute)</option>
+                        </select>
+                        <p class="channel-notify-status" id="channel-notify-status" hidden></p>
+                    </div>
+
+                    <form id="invite-form" class="invite-form" th:data-channel-id="${activeChannel.id}">
+                        <label>Invite user (username)
+                            <input name="username" required autocomplete="off"/>
+                        </label>
+                        <button type="submit" class="invite-submit"
+                                title="Invite to channel" aria-label="Invite to channel">
+                            <svg class="icon" aria-hidden="true"><use href="#icon-user-plus"/></svg>
+                        </button>
+                    </form>
+                    <!--/* Browsing rather than typing an exact handle — for when you know roughly
+                           who you want ("someone on the eng team", "whoever signed up this week")
+                           but not their username. Own dialog rather than another dropdown: it
+                           needs room for a result list, so it follows the poll-builder/forward
+                           shell instead of squeezing into this anchored panel.
+
+                           Wired from find-user-dialog.js: the CSP forbids inline handlers. */-->
+                    <button type="button" id="find-user-btn" class="find-user-trigger"
+                            th:data-channel-id="${activeChannel.id}">
+                        <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-users"/></svg>
+                        Find user…
+                    </button>
+                    <h4>Members</h4>
+                    <ul class="members">
+                        <li th:each="m : ${members}">
+                            <span class="avatar" th:data-author="${m.user.username}">
+                                <img th:if="${m.user.hasAvatar()}" class="avatar-image" alt=""
+                                     th:src="@{/api/users/{u}/avatar(u=${m.user.username},v=${m.user.avatarVersion()})}"/>
+                                <span class="avatar-letter"
+                                      th:text="${#strings.toUpperCase(#strings.substring(m.user.displayName ?: m.user.username, 0, 1))}">U</span>
+                            </span>
+                            <span th:text="${m.user.displayName ?: m.user.username}">user</span>
+                            <small th:text="${m.role}">role</small>
+                        </li>
+                    </ul>
+
+                    <!--/* Leave channel. Destructive and, for a private channel, irreversible from
+                           the user's side, so it is a two-step control rather than a one-click one —
+                           and the second step is inline rather than a native confirm(), which is
+                           unstyleable and reads as a browser error. No modal system for one
+                           two-button question.
+
+                           Wired from index.js: the CSP forbids inline handlers. */-->
+                    <!--/* Archive. Above the leave block, because archiving is a decision about the
+                           channel and leaving is a decision about yourself, and the two want to be
+                           told apart. Two-step for the same reason leaving is, and a stronger one:
+                           this takes the channel away from everyone, not just from whoever clicked.
+
+                           UNARCHIVING IS NOT HERE — it lives on the archived banner beside the
+                           message list. This panel is behind isMember and behind the cog, and an
+                           archived channel cannot be joined, so putting the undo here would hide it
+                           from exactly the person most likely to need it: a workspace admin cleaning
+                           up a channel they were never in. The banner is rendered to anyone who can
+                           read the channel, which is the right audience for it.
+
+                           isAdmin is the channel role; me.admin is the workspace one, read here for
+                           rendering only — the server takes the authoritative decision from Spring's
+                           ROLE_ADMIN authority.
+
+                           Wired from index.js: the CSP forbids inline handlers. */-->
+                    <div class="channel-archive" th:if="${isAdmin or me.admin}"
+                         th:data-channel-id="${activeChannel.id}">
+                        <button th:if="${!activeChannel.archived}" type="button"
+                                id="channel-archive-btn" class="channel-archive-trigger">
+                            <svg class="icon" aria-hidden="true"><use href="#icon-archive"/></svg>
+                            <span>Archive <span class="channel-name-echo"
+                                  th:text="'#' + ${activeChannel.name}">#channel</span></span>
+                        </button>
+                        <div th:if="${!activeChannel.archived}"
+                             class="channel-archive-confirm" id="channel-archive-confirm" hidden>
+                            <p>
+                                The channel becomes read-only for everyone and drops out of the
+                                sidebar and the channel search. Nothing is deleted — the messages
+                                and files stay, and stay searchable.
+                                <strong>You can unarchive it again at any time.</strong>
+                            </p>
+                            <div class="channel-archive-actions">
+                                <button type="button" id="channel-archive-cancel">Cancel</button>
+                                <button type="button" id="channel-archive-go"
+                                        class="channel-archive-danger">Archive channel</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <!--/* Delete. Workspace admins only — me.admin here is for rendering; the server
+                           decides from Spring's ROLE_ADMIN authority. A channel admin gets Archive
+                           above and nothing here, which is the whole point of the pair: the
+                           reversible action is available to the people who run the channel, and the
+                           one with no undo is not.
+
+                           Typing the name is the confirmation, not a second button. There is no
+                           modal machinery for it and none is wanted — the leave and archive controls
+                           above are already inline two-step controls in this panel, so this is the
+                           established pattern here rather than a new one, and the only thing it adds
+                           is a field that has to be filled in correctly. The button stays disabled
+                           until it matches, so the failure mode is "nothing happens", not "an error
+                           after the irreversible click".
+
+                           Wired from index.js: the CSP forbids inline handlers. */-->
+                    <div class="channel-destroy" th:if="${me.admin}"
+                         th:data-channel-id="${activeChannel.id}"
+                         th:data-channel-name="${activeChannel.name}">
+                        <button type="button" id="channel-destroy-btn" class="channel-destroy-trigger">
+                            <svg class="icon" aria-hidden="true"><use href="#icon-trash"/></svg>
+                            <span>Delete <span class="channel-name-echo"
+                                  th:text="'#' + ${activeChannel.name}">#channel</span></span>
+                        </button>
+                        <div class="channel-destroy-confirm" id="channel-destroy-confirm" hidden>
+                            <p>
+                                <strong>This cannot be undone.</strong>
+                                Every message, file, poll, reaction and reminder in this channel is
+                                deleted permanently, for everyone. Consider archiving instead — that
+                                keeps the history and can be reversed.
+                            </p>
+                            <label for="channel-destroy-name">
+                                Type <strong th:text="${activeChannel.name}">channel</strong> to
+                                confirm
+                            </label>
+                            <input id="channel-destroy-name" type="text" autocomplete="off"
+                                   spellcheck="false" aria-describedby="channel-destroy-status"/>
+                            <p class="channel-destroy-status" id="channel-destroy-status" hidden></p>
+                            <div class="channel-destroy-actions">
+                                <button type="button" id="channel-destroy-cancel">Cancel</button>
+                                <button type="button" id="channel-destroy-go"
+                                        class="channel-destroy-danger" disabled>Delete forever</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="channel-leave">
+                        <button type="button" id="channel-leave-btn" class="channel-leave-trigger"
+                                th:data-channel-id="${activeChannel.id}"
+                                th:data-private="${activeChannel.type.name() == 'PRIVATE'}">
+                            <svg class="icon" aria-hidden="true"><use href="#icon-logout"/></svg>
+                            <span>Leave <span class="channel-name-echo"
+                                  th:text="'#' + ${activeChannel.name}">#channel</span></span>
+                        </button>
+                        <div class="channel-leave-confirm" id="channel-leave-confirm" hidden>
+                            <p>
+                                Your messages stay in the channel.
+                                <!--/* Said out loud, because it is the part that cannot be undone
+                                       by the person doing it. */-->
+                                <strong th:if="${activeChannel.type.name() == 'PRIVATE'}">
+                                    This channel is private — you will need an invitation to come
+                                    back.</strong>
+                                <span th:if="${activeChannel.type.name() == 'PUBLIC'}">
+                                    You can rejoin at any time.</span>
+                            </p>
+                            <div class="channel-leave-actions">
+                                <button type="button" id="channel-leave-cancel">Cancel</button>
+                                <button type="button" id="channel-leave-go"
+                                        class="channel-leave-danger">Leave channel</button>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <div class="messages-stack">
+              <div th:replace="~{fragments/zone-prompt :: banner}"></div>
+              <!-- Shown when the page was opened with ?m=<id> (search-result permalink). Lets
+                   the user bail back to the live tail without having to scroll past the
+                   intervening N thousand messages. -->
+              <div id="jump-to-latest-banner" class="jump-to-latest-banner"
+                   th:if="${centeredOnAnchor != null and centeredOnAnchor}">
+                Showing context for an older message.
+                <a th:href="@{'/channels/' + ${activeChannelId}}">Jump to latest →</a>
+              </div>
+              <ol id="messages" class="messages">
+                <th:block th:each="msg, iter : ${messages}"
+                          th:with="prev=${iter.index > 0 ? messages[iter.index - 1] : null},
+                                   curDay=${fmt.dayKey(msg.createdAt)},
+                                   prevDay=${prev != null ? fmt.dayKey(prev.createdAt) : ''},
+                                   showDay=${prev == null or curDay != prevDay},
+                                   sameAuthor=${prev != null and prev.authorUsername == msg.authorUsername and !showDay},
+                                   nameKey=${msg.authorDisplayName ?: msg.authorUsername}">
+                    <li class="message"
+                        th:classappend="${(sameAuthor ? 'grouped ' : '') + (showDay ? 'first-of-day' : '')}"
+                        th:data-id="${msg.id}" th:data-created-at="${msg.createdAt}"
+                        th:data-author="${msg.authorUsername}"
+                        th:data-day="${curDay}"
+                        th:attr="data-body-markdown=${msg.bodyMarkdown},
+                                 data-parent-id=${msg.parentId},
+                                 data-pinned=${msg.pinnedAt != null}">
+                        <!--/* Pinned marker. Rendered above the row rather than inside the meta
+                               line so it reads as a label on the message, and so it survives the
+                               live re-render, which rewrites everything under .message-meta. */-->
+                        <span th:if="${msg.pinnedAt != null}" class="message-pin-flag">
+                            <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-pin"/></svg>
+                            Pinned
+                        </span>
+                        <span class="avatar" th:data-author="${msg.authorUsername}">
+                            <img th:if="${msg.authorHasAvatar}" class="avatar-image" alt=""
+                                 th:src="@{/api/users/{u}/avatar(u=${msg.authorUsername},v=${msg.authorAvatarVersion})}"/>
+                            <span class="avatar-letter"
+                                  th:text="${#strings.toUpperCase(#strings.substring(nameKey, 0, 1))}">U</span>
+                        </span>
+                        <div>
+                            <div class="message-meta">
+                                <span class="author" th:data-author="${msg.authorUsername}" th:text="${nameKey}">user</span>
+                                <span th:if="${msg.authorDisplayName != null and msg.authorDisplayName != msg.authorUsername}"
+                                      class="author-handle"
+                                      th:data-author="${msg.authorUsername}"
+                                      th:text="'@' + ${msg.authorUsername}">@user</span>
+                                <!--/* datetime carries the raw instant so time-format.js can re-render this in the
+       browser-detected zone when the server only had a guess to go on. */-->
+                                <time data-time-format="time"
+                                      th:datetime="${msg.createdAt}"
+                                      th:text="${fmt.time(msg.createdAt)}">time</time>
+                            </div>
+                            <div th:if="${!#strings.isEmpty(msg.bodyMarkdown)}"
+                                 class="message-body" th:utext="${msg.bodyHtml}">html</div>
+                            <a th:replace="~{fragments/link-preview :: card(${msg.linkPreview})}"></a>
+                            <div th:if="${msg.poll != null}"
+                                 class="poll-placeholder"
+                                 th:attr="data-poll-id=${msg.poll.id}">Loading poll…</div>
+                            <div th:if="${msg.reactions != null and !msg.reactions.isEmpty()}" class="message-reactions">
+                                <button th:each="r : ${msg.reactions}" type="button"
+                                        class="reaction"
+                                        th:classappend="${r.mine ? 'mine' : ''}"
+                                        th:data-emoji="${r.emoji}"
+                                        th:data-mine="${r.mine}"
+                                        th:title="${#strings.listJoin(r.usernames, ', ')}">
+                                    <span class="reaction-emoji" th:text="${r.emoji}">👍</span>
+                                    <span class="reaction-count" th:text="${r.count}">1</span>
+                                </button>
+                            </div>
+                            <div th:replace="~{fragments/attachments :: tray(${msg.attachments})}"></div>
+                            <button th:if="${msg.replyCount > 0}" type="button"
+                                    class="thread-indicator"
+                                    th:attr="data-count=${msg.replyCount}"
+                                    th:title="|Open thread (${msg.replyCount} ${msg.replyCount == 1 ? 'reply' : 'replies'})|">
+                                <svg class="icon thread-indicator-icon" aria-hidden="true"><use href="#icon-thread"/></svg>
+                                <span class="thread-indicator-count"
+                                      th:text="|${msg.replyCount} ${msg.replyCount == 1 ? 'reply' : 'replies'}|">1 reply</span>
+                            </button>
+                        </div>
+                    </li>
+                </th:block>
+              </ol>
+              <div id="day-divider-layer" class="day-divider-layer" aria-hidden="true">
+                <th:block th:each="msg, iter : ${messages}"
+                          th:with="prev=${iter.index > 0 ? messages[iter.index - 1] : null},
+                                   curDay=${fmt.dayKey(msg.createdAt)},
+                                   prevDay=${prev != null ? fmt.dayKey(prev.createdAt) : ''},
+                                   showDay=${prev == null or curDay != prevDay}">
+                    <div th:if="${showDay}" class="day-divider"
+                         th:data-anchor-id="${msg.id}"
+                         th:data-day="${curDay}">
+                        <span data-time-format="day" th:data-time-value="${msg.createdAt}"
+                              th:text="${fmt.day(msg.createdAt)}">Today</span>
+                    </div>
+                </th:block>
+              </div>
+            </div>
+
+            <div id="typing-indicator" class="typing-indicator" hidden></div>
+
+            <!--/* Where the composer would be. An archived channel needs something in that space
+                   saying why it is empty — a page that simply stops offering a text box reads as
+                   broken, and "you are not allowed" is the wrong story: everyone is allowed, and
+                   nobody is, because the channel is finished. Rendered for members and non-members
+                   alike, since a public archived channel is readable by anyone. */-->
+            <div id="channel-archived-notice" class="channel-archived-notice"
+                 th:classappend="${activeChannel.archived} ? '' : 'is-hidden'">
+                <svg class="icon" aria-hidden="true"><use href="#icon-archive"/></svg>
+                <p>
+                    <strong>This channel is archived.</strong>
+                    <span th:if="${activeChannel.archivedByUsername != null}"
+                          th:text="|Archived by ${activeChannel.archivedByUsername}| +
+                                   ${activeChannel.archivedAt != null
+                                     ? ' on ' + fmt.date(activeChannel.archivedAt)
+                                     : ''} + '.'">Archived by someone.</span>
+                    It is read-only: the history stays here and stays searchable, but nobody can post
+                    to it.
+                </p>
+                <!--/* The undo, and it lives here rather than in the settings panel because the
+                       settings panel is behind isMember and behind the cog. An archived channel
+                       cannot be joined, so a workspace admin who was never in it would otherwise have
+                       no way to bring it back. One click, no confirmation: unarchiving destroys
+                       nothing, and a confirmation in front of an undo is how a reversible action
+                       starts feeling irreversible. */-->
+                <button th:if="${activeChannel.archived and (isAdmin or me.admin)}" type="button"
+                        id="channel-unarchive-btn"
+                        th:data-channel-id="${activeChannel.id}">
+                    <svg class="icon" aria-hidden="true"><use href="#icon-archive-restore"/></svg>
+                    <span>Unarchive</span>
+                </button>
+            </div>
+
+            <div th:if="${isMember and !activeChannel.archived}" class="composer-wrap"
+                 th:data-channel-id="${activeChannel.id}">
+                <form id="composer" class="composer">
+                    <div id="composer-attachments" class="composer-attachments" hidden></div>
+                    <textarea id="composer-input"
+                              th:placeholder="${'Write to #' + activeChannel.name}"
+                              rows="3" maxlength="8000"></textarea>
+                    <div id="composer-preview" class="composer-preview" hidden>
+                        <div class="composer-preview-label">Preview</div>
+                        <div id="composer-preview-body" class="message-body"></div>
+                    </div>
+                    <div class="composer-toolbar" data-format-target="composer-input">
+                        <button type="button" class="tool" data-format="bold" title="Bold (Ctrl/Cmd+B)"><b>B</b></button>
+                        <button type="button" class="tool" data-format="italic" title="Italic (Ctrl/Cmd+I)"><i>I</i></button>
+                        <button type="button" class="tool" data-format="strike" title="Strikethrough"><s>S</s></button>
+                        <button type="button" class="tool" data-format="link" title="Link (Ctrl/Cmd+K)"><svg class="icon" aria-hidden="true"><use href="#icon-link"/></svg></button>
+                        <button type="button" class="tool" data-format="code" title="Code (Ctrl/Cmd+E)">{ }</button>
+                        <button type="button" class="tool" data-format="quote" title="Quote"><svg class="icon" aria-hidden="true"><use href="#icon-quote"/></svg></button>
+                        <button type="button" class="tool" data-format="list" title="Bulleted list"><svg class="icon" aria-hidden="true"><use href="#icon-list"/></svg></button>
+                        <button type="button" class="tool" id="composer-emoji" title="Insert emoji"><svg class="icon" aria-hidden="true"><use href="#icon-face-smile"/></svg></button>
+                        <button type="button" class="tool" id="composer-poll" title="Create a poll" aria-label="Create a poll"><svg class="icon" aria-hidden="true"><use href="#icon-poll"/></svg></button>
+                        <button type="button" class="tool" id="composer-attach" title="Attach file" aria-label="Attach file">
+    <svg class="icon"><use href="#icon-paperclip"/></svg>
+</button>
+                        <button type="button" class="tool" data-p2p-open="true" title="P2P LAN File Share" aria-label="P2P LAN File Share">
+    <svg class="icon"><use href="#icon-p2p"/></svg>
+</button>
+                        <input type="file" id="composer-file" hidden multiple/>
+                        <span class="spacer"></span>
+                        <button type="submit" class="send-btn">
+                            <svg class="send-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                                <path d="M2.5 20.5 22 12 2.5 3.5 2.5 10 16 12 2.5 14z"/>
+                            </svg>
+                            <span>Send</span>
+                        </button>
+                    </div>
+                </form>
+                <div class="composer-hint">
+                    Markdown supported · **bold**, _italic_, `code`, ```blocks```, [links](url) · Enter to send · Shift+Enter for newline · <svg class="icon icon-sm" aria-hidden="true"><use href="#icon-paperclip"/></svg> to attach
+                </div>
+            </div>
+
+        </div>
+
+    </main>
+
+    <aside id="thread-panel" class="thread-panel" hidden>
+        <header class="thread-header">
+            <h3>Thread</h3>
+            <button type="button" id="thread-close" class="icon-btn" title="Close thread" aria-label="Close thread">
+    <svg class="icon"><use href="#icon-close"/></svg>
+</button>
+        </header>
+        <div id="thread-parent" class="thread-parent"></div>
+        <ol id="thread-replies" class="thread-replies"></ol>
+        <form id="thread-composer" class="composer thread-composer">
+            <textarea id="thread-input" placeholder="Reply to thread…" rows="2" maxlength="8000"></textarea>
+            <div id="thread-preview" class="composer-preview" hidden>
+                <div class="composer-preview-label">Preview</div>
+                <div id="thread-preview-body" class="message-body"></div>
+            </div>
+            <div class="composer-toolbar" data-format-target="thread-input">
+                <button type="button" class="tool" data-format="bold" title="Bold (Ctrl/Cmd+B)"><b>B</b></button>
+                <button type="button" class="tool" data-format="italic" title="Italic (Ctrl/Cmd+I)"><i>I</i></button>
+                <button type="button" class="tool" data-format="strike" title="Strikethrough"><s>S</s></button>
+                <button type="button" class="tool" data-format="link" title="Link (Ctrl/Cmd+K)"><svg class="icon" aria-hidden="true"><use href="#icon-link"/></svg></button>
+                <button type="button" class="tool" data-format="code" title="Code (Ctrl/Cmd+E)">{ }</button>
+                <button type="button" class="tool" data-format="quote" title="Quote"><svg class="icon" aria-hidden="true"><use href="#icon-quote"/></svg></button>
+                <button type="button" class="tool" data-format="list" title="Bulleted list"><svg class="icon" aria-hidden="true"><use href="#icon-list"/></svg></button>
+                <button type="button" class="tool" id="thread-emoji" title="Insert emoji"><svg class="icon" aria-hidden="true"><use href="#icon-face-smile"/></svg></button>
+                <span class="spacer"></span>
+                <button type="submit" class="send-btn">
+                    <svg class="send-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+                        <path d="M2.5 20.5 22 12 2.5 3.5 2.5 10 16 12 2.5 14z"/>
+                    </svg>
+                    <span>Reply</span>
+                </button>
+            </div>
+        </form>
+    </aside>
+</div>
+
+<div id="tutorial-overlay" class="tutorial-overlay" th:if="${!me.tutorialDismissed}" role="dialog" aria-modal="true" aria-labelledby="tutorial-title">
+    <div class="tutorial-card">
+        <button type="button" class="tutorial-skip" id="tutorial-skip" title="Skip tutorial">Skip</button>
+        <h2 id="tutorial-title" th:text="'Welcome to ' + ${appTitle}">Welcome to ThreadForge</h2>
+        <ol class="tutorial-steps">
+            <li><strong>Channels</strong> live in the sidebar on the left. Public ones are joinable; the <span aria-hidden="true">+</span> button creates a new one.</li>
+            <li><strong>Send messages</strong> with the composer at the bottom. Markdown is supported — try <code>**bold**</code>, <code>`code`</code>, or fenced blocks.</li>
+            <li><strong>Search</strong> from the top bar. Two-character minimum.</li>
+            <li><strong>Profile &amp; themes</strong> are behind your avatar (top right).</li>
+        </ol>
+        <div class="tutorial-actions">
+            <button type="button" class="btn" id="tutorial-done">Got it</button>
+        </div>
+    </div>
+</div>
+
+<!-- Vendored libraries stay as separate tags — pre-minified upstream, not re-compiled. -->
+<!-- Element.setHTML() is not Baseline yet (Safari only got it in 26). search-box.js calls it on
+     the escaped search snippets, so polyfill it rather than feature-test at each call site.
+     GoogleChromeLabs/html-setters-polyfill 0.1.1, Apache-2.0, unmodified. -->
+<script th:src="@{/js/vendor/html-setters-polyfill.min.js}"></script>
+<script th:src="@{/js/vendor/stomp.umd.min.js}"></script>
+<script th:src="@{/js/vendor/highlight.min.js}"></script>
+
+<!--/* Calls are placed from a DM, but they arrive wherever you are — so the panel is here too,
+       and the channel page rings just like the conversation page does. Nothing in it can start a
+       call; it only answers one. */-->
+<!--/* Condition on the outer block: th:replace runs before th:if, so both on one tag would
+       include the panel unconditionally. */-->
+<th:block th:if="${callsAvailable}">
+    <th:block th:replace="~{fragments/call-panel :: callPanel}"/>
+</th:block>
+
+<!-- All classic page scripts (theme-loader, emoji-data, chat-kit, hovercard, notifications,
+     mention-inbox, presence, idle-logout) ship as one minified bundle; dev serves the source
+     files instead. Declared in assets.gradle; see ASSETS.md. -->
+<th:block th:replace="~{fragments/assets :: js('chat')}"/>
+<script type="module" th:src="@{/js/chat/index.js}" defer></script>
+<!-- @-mention typeahead for the composer and the thread reply box. Separate module rather than
+     part of index.js because the DM page needs the same behaviour and never loads index.js. -->
+<script type="module" th:src="@{/js/chat/mention-autocomplete-boot.js}" defer></script>
+<!-- Find user browser for the sidebar's new-conversation form — same both-pages reasoning. -->
+<script type="module" th:src="@{/js/chat/new-conversation-picker-boot.js}" defer></script>
+<!-- In-browser smoke runner — only loaded when tforge.dev-tools.enabled=true (auto in
+     the dev profile, off in prod). Type runTests() in the devtools console. -->
+<script th:if="${devToolsEnabled}" type="module" th:src="@{/js/test/index.js}" defer></script>
+</body>
+</html>

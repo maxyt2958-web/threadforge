@@ -1,0 +1,191 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.threadforge.chat.web;
+
+import com.threadforge.chat.domain.Conversation;
+import com.threadforge.chat.domain.ConversationMessage;
+import com.threadforge.chat.domain.ConversationType;
+import com.threadforge.chat.domain.NotificationLevel;
+import com.threadforge.chat.domain.User;
+import com.threadforge.chat.service.ConversationService;
+import com.threadforge.chat.service.MentionService;
+import com.threadforge.chat.service.NotificationPreferenceService;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.stereotype.Component;
+
+import java.util.Collection;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Tells a conversation's members, individually, that a message arrived.
+ *
+ * <p>{@code /topic/conversations/{id}} already carries the message, but only to clients that
+ * subscribed to that conversation — which means the page you are looking at. A direct message is
+ * precisely the thing you need to hear about when you are looking at something else, so it needs
+ * a destination the client is subscribed to wherever it is. That is
+ * {@code /user/queue/conversation-alerts}: Spring resolves a user destination per session, so a
+ * member receives only their own, on every tab they have open.
+ *
+ * <p><b>Not a second delivery path.</b> The alert is a notice, not the message: id, who, and a
+ * short preview for the toast. The message itself still arrives once, on the conversation topic.
+ * Sending the full DTO here would mean two sources of truth for the same message and a rendering
+ * path that only runs when you happen to be elsewhere — the kind that rots unnoticed.
+ *
+ * <p>The author is skipped. Being notified of your own message is noise, and with a sound
+ * attached it is worse than noise.
+ *
+ * <p>Failures are swallowed and logged. A broken notification must not fail the send that
+ * triggered it; the message is already committed and broadcast by the time this runs, and
+ * throwing here would surface to the sender as a failed send of a message that was in fact
+ * delivered.
+ *
+ * <p><b>This is where a conversation's notification level takes effect</b>, and it is the only
+ * place: the topic broadcast is the message and goes out regardless — a member with the page open
+ * still sees what was said — while this is the interruption, and the interruption is what a level
+ * controls. Muting is not "pretend nothing happened": the unread count still moves, because it is a
+ * fact about the conversation rather than a request for attention.
+ *
+ * <p><b>A conversation's level means what it says, including MENTIONS.</b> That took two account
+ * defaults to arrange. There is one for channels (shipped MENTIONS) and one for conversations
+ * (shipped ALL), because the same word wants different answers in the two places: most traffic in a
+ * room you joined is other people's business, while a message sent to you and nobody else is
+ * addressed to you whether or not it spells your name.
+ *
+ * <p>With a single default this could not be honoured. Conversations inherited the channel default,
+ * so reading MENTIONS strictly would have stopped delivering direct messages to every existing
+ * account the moment it shipped — a regression dressed as a feature — and the code therefore
+ * ignored MENTIONS and let only NONE silence a conversation. What that cost was the setting a
+ * twenty-person group DM actually wants: "tell me when someone says my name". Now that
+ * conversations inherit their own default, seeded ALL, a member who picks MENTIONS has picked it
+ * deliberately, a 1:1 keeps notifying, and nobody's messages went quiet because a migration ran.
+ * This is the shape Slack uses, reached the same way.
+ *
+ * <p>The picker on the conversation page therefore offers all four —
+ * <em>Default / Every message / Mentions only / Nothing</em> — labelling the inherited option by
+ * what it currently resolves to. What the mention test below still buys
+ * is the {@code mention} flag on the alert, which is how a client can tell "somebody said your name"
+ * from ordinary traffic — and it is why {@code @channel} in a group conversation is not decoration.
+ */
+@Component
+public class ConversationAlertPublisher {
+
+    private static final Logger log = LoggerFactory.getLogger(ConversationAlertPublisher.class);
+
+    /** Long enough to recognise the message, short enough not to leak a wall of text into a toast. */
+    private static final int PREVIEW_CHARS = 200;
+
+    private final ConversationService conversations;
+    private final NotificationPreferenceService preferences;
+    private final MentionService mentions;
+    private final SimpMessagingTemplate broker;
+
+    public ConversationAlertPublisher(ConversationService conversations,
+                                      NotificationPreferenceService preferences,
+                                      MentionService mentions,
+                                      SimpMessagingTemplate broker) {
+        this.conversations = conversations;
+        this.preferences = preferences;
+        this.mentions = mentions;
+        this.broker = broker;
+    }
+
+    public void alert(Conversation conversation, ConversationMessage message) {
+        alert(conversation, message, List.of());
+    }
+
+    /**
+     * @param threadParticipants usernames of the people already in this message's thread, for a
+     *        reply. Being in a thread is what makes a reply addressed to you, in the same sense a
+     *        mention is — so it clears the MENTIONS bar, exactly as it does on the channel side.
+     *        Empty for a message in the conversation feed, which is addressed to everybody by
+     *        construction.
+     */
+    public void alert(Conversation conversation, ConversationMessage message,
+                      List<String> threadParticipants) {
+        try {
+            User author = message.getAuthor();
+            String preview = preview(message.getBodyMarkdown());
+            String authorName = author.getDisplayName() != null && !author.getDisplayName().isBlank()
+                    ? author.getDisplayName()
+                    : author.getUsername();
+            var levels = preferences.effectiveLevelsFor(conversation);
+            var handles = lowercased(mentions.extractHandles(message.getBodyMarkdown()));
+            // @channel / @here / @everyone name the room, so they name everyone in it. A
+            // conversation needs no `message_mentions` equivalent to answer "who is everyone here":
+            // that set is the loop this is already standing inside. See the class note above.
+            boolean broadcastHandle = handles.stream().anyMatch(h -> MentionService.broadcastFor(h) != null);
+            var inThread = lowercased(threadParticipants);
+
+            for (var member : conversations.members(conversation)) {
+                User recipient = member.getUser();
+                if (recipient.getId().equals(author.getId())) continue;
+
+                boolean named = broadcastHandle
+                        || handles.contains(recipient.getUsername().toLowerCase(Locale.ROOT))
+                        || inThread.contains(recipient.getUsername().toLowerCase(Locale.ROOT));
+                var level = levels.getOrDefault(recipient.getId(), NotificationLevel.ALL);
+                if (level == NotificationLevel.NONE) continue;
+                // MENTIONS means what it says here now. It could not before: conversations
+                // inherited the *channel* account default, which ships as MENTIONS, so honouring it
+                // would have stopped delivering direct messages to every existing account at once.
+                // Conversations now inherit their own account default, seeded ALL, so a member who
+                // chose MENTIONS on a twenty-person group DM chose it deliberately and gets it —
+                // and a 1:1 still notifies, because that default is ALL.
+                if (level == NotificationLevel.MENTIONS && !named) continue;
+
+                // A direct conversation has no title of its own — it is "the conversation with
+                // that person", so from the recipient's side the sender's name is the title.
+                String title = conversation.getType() == ConversationType.DIRECT
+                        ? authorName
+                        : conversation.getTitle();
+
+                broker.convertAndSendToUser(recipient.getUsername(), "/queue/conversation-alerts",
+                        Map.of(
+                                "conversationId", conversation.getId(),
+                                "type", conversation.getType().name(),
+                                "title", title == null ? "" : title,
+                                "author", authorName,
+                                "authorUsername", author.getUsername(),
+                                "messageId", message.getId(),
+                                "mention", named,
+                                "preview", preview));
+            }
+        } catch (RuntimeException e) {
+            log.warn("Could not publish conversation alerts for conversation {}",
+                    conversation.getId(), e);
+        }
+    }
+
+    private static Set<String> lowercased(Collection<String> in) {
+        if (in == null || in.isEmpty()) return Set.of();
+        var out = new HashSet<String>(in.size());
+        for (var s : in) if (s != null) out.add(s.toLowerCase(Locale.ROOT));
+        return out;
+    }
+
+    private static String preview(String body) {
+        if (body == null) return "";
+        String flat = body.replaceAll("\\s+", " ").trim();
+        return flat.length() > PREVIEW_CHARS ? flat.substring(0, PREVIEW_CHARS - 1) + "…" : flat;
+    }
+}

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+    <meta name="theme-color" content="#18181b"/>
+    <title th:text="${appTitle}">ThreadForge</title>
+    <meta name="description"
+          content="ThreadForge — fast, self-hosted team messaging with channels, threads, WebRTC calls, and LAN P2P file sharing."/>
+    <link rel="icon" th:href="${appFaviconUrl}"/>
+    <th:block th:replace="~{fragments/assets :: css('app')}"/>
+</head>
+<body class="landing">
+<main>
+    <h1>
+        <th:block th:replace="~{fragments/logo :: mark('landing-logo')}"/>
+        <span th:text="${appTitle}">ThreadForge</span>
+    </h1>
+    <p class="landing-lede">Private, self-hosted workspace messaging — built for real-time channels,
+        focused threads, direct calls, and rapid local file sharing.</p>
+
+    <ul class="landing-features">
+        <li><strong>Structured threads &amp; channels</strong> — keep side discussions organized
+            without drowning out the main room.</li>
+        <li><strong>1:1 voice &amp; video calls</strong> — WebRTC calling directly from direct
+            messages with ephemeral TURN relay support.</li>
+        <li><strong>LAN P2P file sharing &amp; rich Markdown</strong> — transfer large files over
+            your local network, share code blocks, diagrams, and quick <code>/poll</code> votes.</li>
+        <li><strong>Instant local search &amp; SSO</strong> — embedded Lucene indexing with
+            Keycloak OIDC authentication under your control.</li>
+    </ul>
+
+    <p class="landing-error" role="alert" th:if="${param.login != null and param.login[0] == 'failed'}">
+        Sign-in could not be completed. Please try again or contact your workspace administrator.
+    </p>
+    <p>
+        <a class="btn" th:href="@{/oauth2/authorization/keycloak}">Sign in</a>
+        <a class="btn btn-secondary" th:href="@{/oauth2/authorization/keycloak(action=register)}">Create account</a>
+    </p>
+</main>
+</body>
+</html>

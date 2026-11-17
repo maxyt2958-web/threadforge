@@ -1,0 +1,112 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.threadforge.chat.web;
+
+import com.threadforge.chat.security.CurrentUser;
+import com.threadforge.chat.security.RateLimitExceededException;
+import com.threadforge.chat.security.RateLimiter;
+import com.threadforge.chat.service.ConversationService;
+import com.threadforge.chat.service.MarkdownRenderer;
+import com.threadforge.chat.web.dto.ConversationMessageDto;
+import com.threadforge.chat.web.dto.SendMessageRequest;
+import com.threadforge.chat.web.dto.TypingEvent;
+import jakarta.validation.Valid;
+import org.springframework.messaging.handler.annotation.DestinationVariable;
+import org.springframework.messaging.handler.annotation.MessageMapping;
+import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.stereotype.Controller;
+
+import java.security.Principal;
+import java.time.Duration;
+
+/**
+ * STOMP send for direct messages. Mirrors {@link ChatWebSocketController#send} but
+ * routes to {@code /topic/conversations/{id}}. Subscribe-side authorization is
+ * enforced in {@code StompAuthorizationConfig}.
+ */
+@Controller
+public class ConversationWebSocketController {
+
+    private final ConversationService conversations;
+    private final MarkdownRenderer markdown;
+    private final CurrentUser currentUser;
+    private final SimpMessagingTemplate broker;
+    private final RateLimiter rateLimiter;
+    private final ConversationAlertPublisher alerts;
+    private final LinkPreviews linkPreviews;
+
+    public ConversationWebSocketController(ConversationService conversations,
+                                           MarkdownRenderer markdown,
+                                           CurrentUser currentUser,
+                                           SimpMessagingTemplate broker,
+                                           RateLimiter rateLimiter,
+                                           ConversationAlertPublisher alerts,
+                                           LinkPreviews linkPreviews) {
+        this.linkPreviews = linkPreviews;
+        this.conversations = conversations;
+        this.markdown = markdown;
+        this.currentUser = currentUser;
+        this.broker = broker;
+        this.rateLimiter = rateLimiter;
+        this.alerts = alerts;
+    }
+
+    @MessageMapping("/conversations/{conversationId}/send")
+    public void send(@DestinationVariable Long conversationId,
+                     @Valid SendMessageRequest payload,
+                     Principal principal) {
+        var user = currentUser.resolve(principal);
+        if (!rateLimiter.tryAcquire(user.getUsername(), "ws-conv-send", 30, Duration.ofMinutes(1))) {
+            throw new RateLimitExceededException("send rate exceeded");
+        }
+        var conversation = conversations.requireById(conversationId);
+        var saved = conversations.post(conversation, user, payload.body());
+        var dto = ConversationMessageDto.from(saved, markdown.renderInConversation(saved.getBodyMarkdown()));
+        broker.convertAndSend("/topic/conversations/" + conversationId, dto);
+        linkPreviews.unfurl(dto);
+        // Separately, tell members who aren't subscribed to this conversation right now — the
+        // topic above only reaches the page they'd have to already be looking at.
+        alerts.alert(conversation, saved);
+    }
+
+    /**
+     * "X is typing…" for a conversation, mirroring {@link ChatWebSocketController#typing}.
+     *
+     * <p>This is the feature a 1:1 misses most. In a channel a typing indicator says one of forty
+     * people is composing something; in a DM it says <em>the person you are waiting for is
+     * answering you right now</em>, which is the difference between waiting and giving up.
+     *
+     * <p>Same budget as channels — clients throttle to one ping per 2s and the server caps at 60 a
+     * minute — and excess pings are dropped rather than refused: a typing indicator is not worth an
+     * ERROR frame, and tearing down the socket over one would cost the message being typed.
+     *
+     * <p>Membership is required, because broadcasting into a conversation is a write. A DM has no
+     * PUBLIC analogue for this to short-circuit on, so {@code requireMember} is both the read and
+     * the write check here and there is no second, weaker one to reach for by mistake.
+     */
+    @MessageMapping("/conversations/{conversationId}/typing")
+    public void typing(@DestinationVariable Long conversationId, Principal principal) {
+        var user = currentUser.resolve(principal);
+        if (!rateLimiter.tryAcquire(user.getUsername(), "ws-conv-typing", 60, Duration.ofMinutes(1))) {
+            return; // silently drop excess typing pings
+        }
+        var conversation = conversations.requireById(conversationId);
+        conversations.requireMember(conversation, user);
+        broker.convertAndSend("/topic/conversations/" + conversationId + "/typing",
+                new TypingEvent(user.getUsername(), user.getDisplayName()));
+    }
+}

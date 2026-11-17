@@ -1,0 +1,349 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * The message-search box: debounced query, keyboard-navigable dropdown, clear button.
+ *
+ * There is one of these per page and it lives in the top bar. There used to be three search inputs
+ * on screen at once — "Search messages…" here, "Search channels…" in the sidebar, "Search this
+ * channel…" in the channel header — with three different meanings and nothing to tell them apart
+ * but their placeholder text. The channel-header box is gone; the sidebar's is a different tool
+ * (find a channel, not a message) and stays.
+ *
+ * Scope is read from the form's own hidden fields rather than passed in, so the dropdown and the
+ * results page the form submits to are searching the same thing by construction. The box's
+ * placeholder names that scope, because a search that silently narrows itself is the same class of
+ * bug as one that silently means something else.
+ *
+ * Results come back as SearchHitDto: a discriminated `scope` plus a precomputed `url`, so this
+ * never has to know how to build a link to a channel message versus a conversation message.
+ */
+
+/** @param inputId id of the <input type="search">; it must live inside a form pointing at /search */
+export function initSearchBox(inputId) {
+  const input = document.getElementById(inputId);
+  if (!input) return;
+
+  // channelId → channel name, read from the sidebar so a row can say "#general" without a second
+  // round-trip. Only a hint: the server also sends channelName, which is the fallback for a
+  // channel that isn't in this page's shortlist.
+  const channelNames = new Map();
+  document.querySelectorAll('#sidebar-channel-list li, .sidebar .channel-list > li')
+      .forEach((li) => {
+        const a = li.querySelector('a');
+        if (!a) return;
+        const id = (a.getAttribute('href') || '').split('/').pop();
+        const spans = a.querySelectorAll('span');
+        const name = spans[1]?.textContent.trim();
+        if (id && name && !channelNames.has(id)) channelNames.set(id, name);
+      });
+
+  let dropdown = null;
+  let debounce = null;
+  let activeIndex = -1;
+  let inflight = 0; // monotonic request id — drop stale responses
+
+  const close = () => {
+    // Cancel a pending debounced search and invalidate any in-flight response, so a query
+    // scheduled just before Escape / outside-click can't fire and reopen the dropdown.
+    clearTimeout(debounce);
+    inflight++;
+    dropdown?.remove();
+    dropdown = null;
+    activeIndex = -1;
+  };
+
+  /**
+   * Re-place the dropdown under the field. Measures, so it is throttled to one animation frame by
+   * repositionSoon() below — it is bound to scroll in the capture phase, which fires for every
+   * scroller on the page, and measuring per event forces a layout per event.
+   */
+  const position = () => {
+    if (!dropdown) return;
+    const r = input.getBoundingClientRect();
+    dropdown.style.top = (r.bottom + 4) + 'px';
+    dropdown.style.left = r.left + 'px';
+    dropdown.style.right = 'auto';
+    dropdown.style.minWidth = Math.max(r.width, 320) + 'px';
+  };
+
+  let positionRaf = 0;
+  const repositionSoon = () => {
+    if (positionRaf || !dropdown) return;
+    positionRaf = requestAnimationFrame(() => {
+      positionRaf = 0;
+      position();
+    });
+  };
+
+  const highlight = () => {
+    if (!dropdown) return;
+    const rows = dropdown.querySelectorAll('.search-dropdown-row');
+    // Classes for every row first, then one scrollIntoView. Scrolling inside the loop forces a
+    // layout in the middle of it, with the rows the loop has not reached yet still to be written.
+    rows.forEach((row, i) => row.classList.toggle('active', i === activeIndex));
+    if (activeIndex >= 0) rows[activeIndex].scrollIntoView({ block: 'nearest' });
+  };
+
+  const navigate = (url) => {
+    close();
+    window.location.href = url;
+  };
+
+  // ---------- Clear button ----------
+  // Sits inside the field rather than beside it: it belongs to the text, and a control outside
+  // the box reads as a separate action on the page. Hidden while the field is empty, because a
+  // clear button with nothing to clear is a target that does nothing.
+  const clearBtn = input.parentElement?.querySelector('.search-clear') || null;
+  const syncClear = () => {
+    if (clearBtn) clearBtn.hidden = input.value.length === 0;
+  };
+  clearBtn?.addEventListener('click', () => {
+    input.value = '';
+    syncClear();
+    close();
+    input.focus();
+    // Let anything else watching the field (the sidebar channel filter shares this shape)
+    // react to the box becoming empty.
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  });
+  syncClear();
+
+  // The scope, straight off the form. channelId / conversationId are rendered by the top-bar
+  // fragment when the page has one, and they say both what to search and where to get back to.
+  // Reading them here instead of taking them as an argument is what keeps the dropdown and the
+  // results page from being able to disagree.
+  const scopeParams = () => {
+    const params = new URLSearchParams();
+    input.form?.querySelectorAll('input[type="hidden"][name]').forEach((el) => {
+      if (el.value) params.set(el.name, el.value);
+    });
+    return params;
+  };
+
+  /** Where "see everything" goes: the server-rendered results page, same query, same scope. */
+  const fullResultsUrl = () => {
+    const params = scopeParams();
+    params.set('q', input.value.trim());
+    return '/search?' + params.toString();
+  };
+
+  /**
+   * Put an escaped, <mark>-highlighted snippet into an element.
+   *
+   * Native Element.setHTML where the browser has it: it is the sanitizer this markup was written
+   * for, and the one that keeps working if the server's escaping ever slips. Safari has not shipped
+   * it, and js/vendor/html-setters-polyfill.min.js provides only the *Unsafe family, so there the
+   * string is rebuilt here instead of being handed to innerHTML — which would be a sanitizer-shaped
+   * call with no sanitizer behind it.
+   *
+   * The grammar is narrow and the server owns both ends of it: Lucene's SimpleHTMLEncoder escapes
+   * &, <, > and ", and SimpleHTMLFormatter wraps matched runs in <mark>. Everything between those
+   * tags becomes a text node, so no markup the server did not ask for can be created — an <img> in
+   * somebody's message arrives escaped and stays visible text — and an unbalanced <mark> degrades
+   * to literal text rather than to an open element.
+   */
+  const MARKED = /<mark>([\s\S]*?)<\/mark>/g;
+  const ENTITY = { '&amp;': '&', '&lt;': '<', '&gt;': '>', '&quot;': '"', '&#39;': "'", '&apos;': "'" };
+  const unescapeEntities = (text) => text.replace(/&(?:amp|lt|gt|quot|#39|apos);/g, (e) => ENTITY[e]);
+
+  const renderSnippet = (el, html, opts) => {
+    const text = html || '';
+    if (typeof el.setHTML === 'function' && !(opts && opts.forceFallback)) {
+      el.setHTML(text);
+      return;
+    }
+    const out = document.createDocumentFragment();
+    let last = 0;
+    let match;
+    MARKED.lastIndex = 0;
+    while ((match = MARKED.exec(text)) !== null) {
+      if (match.index > last) out.append(unescapeEntities(text.slice(last, match.index)));
+      const mark = document.createElement('mark');
+      mark.textContent = unescapeEntities(match[1]);
+      out.append(mark);
+      last = MARKED.lastIndex;
+    }
+    if (last < text.length) out.append(unescapeEntities(text.slice(last)));
+    el.replaceChildren(out);
+  };
+
+  // The dev-profile smoke suite drives the fallback path directly — it has to be exercised on the
+  // browsers that do have setHTML, or it would only ever be tested where nobody develops.
+  window.SearchBoxTestHooks = { renderSnippet: renderSnippet };
+
+  const render = (items) => {
+    close();
+    dropdown = document.createElement('div');
+    dropdown.className = 'search-dropdown';
+    if (!items.length) {
+      const empty = document.createElement('div');
+      empty.className = 'search-dropdown-empty';
+      empty.textContent = 'No matches.';
+      dropdown.appendChild(empty);
+    } else {
+      items.forEach((m, i) => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'search-dropdown-row';
+        // The server precomputes the link, because a hit is either a channel message or a
+        // conversation message and only it knows which.
+        row.dataset.url = m.url;
+        row.dataset.index = String(i);
+        const label = m.scope === 'conversation'
+            ? (m.conversationTitle || (m.conversationType === 'DIRECT' ? 'Direct message' : 'Group'))
+            : (() => {
+                const n = channelNames.get(String(m.channelId)) || m.channelName;
+                return n ? '#' + n : '';
+              })();
+        row.innerHTML =
+            '<div class="search-dropdown-meta">' +
+              '<span class="search-dropdown-author"></span>' +
+              '<span class="search-dropdown-channel"></span>' +
+              '<span class="search-dropdown-tag" hidden>not joined</span>' +
+              '<time class="search-dropdown-time"></time>' +
+            '</div>' +
+            '<div class="search-dropdown-snippet"></div>' +
+            '<div class="search-dropdown-files" hidden></div>';
+        row.querySelector('.search-dropdown-author').textContent =
+            m.authorDisplayName || m.authorUsername;
+        row.querySelector('.search-dropdown-channel').textContent = label;
+        // Search spans every public channel, so a hit can come from a room the user has never
+        // opened. Saying so here is what stops the read-only page it leads to reading as a bug:
+        // no composer, no membership, and until now nothing that explained either.
+        row.querySelector('.search-dropdown-tag').hidden = m.channelJoined !== false;
+        row.querySelector('.search-dropdown-time').textContent =
+            ChatTime.formatDateTime(m.createdAt);
+        // bodySnippet is the Lucene-highlighted excerpt with <mark>-wrapped match terms
+        // (HTML-escaped before highlighting). Falls back to bodyHtml — the server-rendered,
+        // jsoup-sanitized body — when there is no snippet.
+        // renderSnippet, not innerHTML: unlike a message body (which needs its embed iframe and
+        // its data-* attributes to survive — see ChatKit.renderMessageBody), a snippet is escaped
+        // text plus <mark>, so the browser's sanitizer costs nothing here and is a second lock
+        // under the server's escaping. Where the browser has no sanitizer, renderSnippet rebuilds
+        // the snippet from text nodes rather than trusting the string.
+        renderSnippet(row.querySelector('.search-dropdown-snippet'), m.bodySnippet || m.bodyHtml || '');
+        // Filenames are searchable, so a row can be here because of a file rather than because of
+        // anything in its text — and a file posted without a caption has no text at all, which used
+        // to draw as an empty row. matchedFilenames are HTML-escaped and <mark>-wrapped by the same
+        // highlighter as the snippet, so they go in on the same terms as it — the icon stays a
+        // plain assignment, since a sanitizer has no business deciding about <use>.
+        const matchedFiles = m.matchedFilenames || [];
+        if (matchedFiles.length) {
+          const files = row.querySelector('.search-dropdown-files');
+          // The icon keeps innerHTML: setHTML removes <use> unconditionally, which would take
+          // every sprite icon off the page. Only the filenames go through renderSnippet.
+          files.innerHTML = '<svg class="icon icon-sm" aria-hidden="true"><use href="#icon-paperclip"/></svg><span></span>';
+          renderSnippet(files.querySelector('span'), matchedFiles.join(', '));
+          files.hidden = false;
+        }
+        // mousedown so the input doesn't blur (and close us) before the click fires.
+        row.addEventListener('mousedown', (ev) => {
+          ev.preventDefault();
+          navigate(row.dataset.url);
+        });
+        row.addEventListener('mouseenter', () => { activeIndex = i; highlight(); });
+        dropdown.appendChild(row);
+      });
+    }
+    // Always offered, hits or not. The dropdown shows ten results and never said so, which made a
+    // list of ten look like the answer; this is the only thing on screen that admits there may be
+    // more, and it is also the way to a set you can actually review.
+    const all = document.createElement('button');
+    all.type = 'button';
+    all.className = 'search-dropdown-all';
+    all.textContent = 'See all results for “' + input.value.trim() + '”';
+    all.addEventListener('mousedown', (ev) => {
+      ev.preventDefault();
+      navigate(fullResultsUrl());
+    });
+    dropdown.appendChild(all);
+    document.body.appendChild(dropdown);
+    position();
+    activeIndex = -1;
+  };
+
+  async function fetchResults(q) {
+    const params = scopeParams();
+    params.set('q', q);
+    // Ten is a taste of the result set, not the result set. The "See all results" row below them
+    // is what admits that, and is why this number no longer has to be a compromise.
+    params.set('limit', '10');
+    const res = await fetch('/api/search?' + params.toString());
+    if (!res.ok) return [];
+    return await res.json();
+  }
+
+  input.addEventListener('input', () => {
+    syncClear();
+    clearTimeout(debounce);
+    const q = input.value.trim();
+    if (q.length < 2) { close(); return; }
+    const myReq = ++inflight;
+    debounce = setTimeout(async () => {
+      const items = await fetchResults(q);
+      if (myReq !== inflight) return;   // a newer request started; drop this response
+      render(items);
+    }, 220);
+  });
+
+  input.addEventListener('focus', () => {
+    const q = input.value.trim();
+    if (q.length >= 2 && !dropdown) input.dispatchEvent(new Event('input'));
+  });
+
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && !dropdown && input.value) {
+      input.value = '';
+      syncClear();
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+      return;
+    }
+    if (!dropdown) return;
+    const rows = dropdown.querySelectorAll('.search-dropdown-row');
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      activeIndex = rows.length === 0 ? -1 : Math.min(activeIndex + 1, rows.length - 1);
+      highlight();
+    } else if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      activeIndex = Math.max(activeIndex - 1, 0);
+      highlight();
+    } else if (e.key === 'Enter') {
+      // Only when the user has arrowed to a row, i.e. has said which result they meant. With no
+      // selection this falls through and the form submits to /search.
+      //
+      // It used to navigate to rows[0] instead: pressing Enter after typing threw you into whatever
+      // Lucene had ranked first — a different channel, scrolled to a message from last March, with
+      // the page you were reading gone and nothing but a "Jump to latest" banner to get out. A
+      // search box must never move the user somewhere they did not choose.
+      if (activeIndex >= 0 && rows[activeIndex]) {
+        e.preventDefault();
+        navigate(rows[activeIndex].dataset.url);
+      }
+    } else if (e.key === 'Escape') {
+      close();
+    }
+  });
+
+  document.addEventListener('mousedown', (e) => {
+    if (!dropdown) return;
+    if (dropdown.contains(e.target) || input.contains(e.target)) return;
+    close();
+  });
+  window.addEventListener('resize', repositionSoon);
+  window.addEventListener('scroll', repositionSoon, true);
+}

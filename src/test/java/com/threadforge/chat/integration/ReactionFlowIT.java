@@ -1,0 +1,274 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.threadforge.chat.integration;
+
+import com.threadforge.chat.domain.ChannelType;
+import com.threadforge.chat.domain.User;
+import com.threadforge.chat.repository.MessageReactionRepository;
+import com.threadforge.chat.repository.UserRepository;
+import com.threadforge.chat.service.ChannelService;
+import com.threadforge.chat.service.MessageService;
+import com.threadforge.chat.service.ReactionService;
+import jakarta.persistence.EntityManager;
+import jakarta.persistence.PersistenceContext;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.security.access.AccessDeniedException;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.transaction.annotation.Transactional;
+import org.testcontainers.containers.PostgreSQLContainer;
+import org.testcontainers.junit.jupiter.Container;
+import org.testcontainers.junit.jupiter.Testcontainers;
+
+import java.util.List;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+@Testcontainers
+@SpringBootTest(
+        classes = IntegrationTestApplication.class,
+        webEnvironment = SpringBootTest.WebEnvironment.NONE
+)
+@Transactional
+class ReactionFlowIT {
+
+    @Container
+    @SuppressWarnings("resource")
+    static final PostgreSQLContainer<?> POSTGRES = new PostgreSQLContainer<>("postgres:18-alpine")
+            .withDatabaseName("chat")
+            .withUsername("chat")
+            .withPassword("chat");
+
+    @DynamicPropertySource
+    static void datasource(DynamicPropertyRegistry registry) {
+        registry.add("spring.datasource.url", POSTGRES::getJdbcUrl);
+        registry.add("spring.datasource.username", POSTGRES::getUsername);
+        registry.add("spring.datasource.password", POSTGRES::getPassword);
+        registry.add("spring.flyway.enabled", () -> "true");
+        registry.add("spring.jpa.hibernate.ddl-auto", () -> "validate");
+        registry.add("tforge.search.lucene-dir", () -> "build/test-lucene/ReactionFlowIT");
+    }
+
+    @Autowired UserRepository users;
+    @Autowired ChannelService channels;
+    @Autowired MessageService messages;
+    @Autowired ReactionService reactions;
+    @Autowired MessageReactionRepository reactionRepo;
+    @PersistenceContext EntityManager em;
+
+    private static final AtomicInteger SEQ = new AtomicInteger();
+
+    private User newUser(String prefix) {
+        var i = SEQ.incrementAndGet();
+        return users.save(new User("kc-" + prefix + i, prefix + i, prefix + i + "@e", prefix + " " + i));
+    }
+
+    @Test
+    void addingReactionShowsUpInGrouping() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var msg = messages.post(room, alice, "hi");
+        em.flush();
+
+        reactions.addReaction(msg.getId(), bob, "👍");
+        em.flush();
+
+        var groups = reactions.groupingsFor(msg, bob);
+        assertThat(groups).hasSize(1);
+        assertThat(groups.get(0).emoji()).isEqualTo("👍");
+        assertThat(groups.get(0).count()).isEqualTo(1);
+        assertThat(groups.get(0).mine()).isTrue();
+        assertThat(groups.get(0).usernames()).containsExactly(bob.getUsername());
+    }
+
+    @Test
+    void duplicateReactionFromSameUserIsIdempotent() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var msg = messages.post(room, alice, "hi");
+        em.flush();
+
+        reactions.addReaction(msg.getId(), bob, "👍");
+        reactions.addReaction(msg.getId(), bob, "👍");
+        em.flush();
+
+        var groups = reactions.groupingsFor(msg, bob);
+        assertThat(groups).hasSize(1);
+        assertThat(groups.get(0).count()).isEqualTo(1);
+    }
+
+    @Test
+    void multipleUsersAndEmojisGroupCorrectly() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var carol = newUser("carol");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        channels.join(room, carol);
+        // bob authors, so alice and carol are the only reactors and the `mine` assertions below
+        // read from alice's point of view without the author's own reaction in the counts.
+        var msg = messages.post(room, bob, "hi");
+        em.flush();
+
+        reactions.addReaction(msg.getId(), alice, "👍");
+        reactions.addReaction(msg.getId(), carol, "👍");
+        reactions.addReaction(msg.getId(), carol, "❤️");
+        em.flush();
+
+        var groups = reactions.groupingsFor(msg, alice);
+        assertThat(groups).hasSize(2);
+        var thumbs = groups.stream().filter(g -> g.emoji().equals("👍")).findFirst().orElseThrow();
+        assertThat(thumbs.count()).isEqualTo(2);
+        assertThat(thumbs.usernames()).containsExactlyInAnyOrder(alice.getUsername(), carol.getUsername());
+        assertThat(thumbs.mine()).isTrue(); // viewer is alice, who reacted with 👍
+        var heart = groups.stream().filter(g -> g.emoji().equals("❤️")).findFirst().orElseThrow();
+        assertThat(heart.count()).isEqualTo(1);
+        assertThat(heart.mine()).isFalse();
+    }
+
+    @Test
+    void removeReactionDeletesIt() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var msg = messages.post(room, alice, "hi");
+        em.flush();
+
+        reactions.addReaction(msg.getId(), bob, "👍");
+        em.flush();
+        assertThat(reactions.groupingsFor(msg, bob)).hasSize(1);
+
+        reactions.removeReaction(msg.getId(), bob, "👍");
+        em.flush();
+        assertThat(reactions.groupingsFor(msg, bob)).isEmpty();
+    }
+
+    @Test
+    void removingReactionThatDoesntExistIsNoop() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var msg = messages.post(room, alice, "hi");
+        em.flush();
+
+        // Should not throw.
+        reactions.removeReaction(msg.getId(), bob, "👍");
+    }
+
+    @Test
+    void privateChannelNonMemberCannotReact() {
+        var owner = newUser("owner");
+        var snoop = newUser("snoop");
+        var secret = channels.create("s-" + SEQ.incrementAndGet(), null, ChannelType.PRIVATE, owner);
+        var msg = messages.post(secret, owner, "internal");
+        em.flush();
+
+        assertThatThrownBy(() -> reactions.addReaction(msg.getId(), snoop, "👍"))
+                .isInstanceOf(AccessDeniedException.class);
+    }
+
+    @Test
+    void emojiValidation() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var msg = messages.post(room, alice, "hi");
+        em.flush();
+
+        assertThatThrownBy(() -> reactions.addReaction(msg.getId(), bob, ""))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> reactions.addReaction(msg.getId(), bob, "  "))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> reactions.addReaction(msg.getId(), bob, "a".repeat(65)))
+                .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> reactions.addReaction(msg.getId(), bob, "badchars"))
+                .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    void groupingsForMessagesBatch() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var m1 = messages.post(room, alice, "one");
+        var m2 = messages.post(room, alice, "two");
+        em.flush();
+
+        reactions.addReaction(m1.getId(), bob, "👍");
+        reactions.addReaction(m2.getId(), bob, "❤️");
+        em.flush();
+
+        var batch = reactions.groupingsFor(List.of(m1, m2), bob);
+        assertThat(batch).hasSize(2);
+        assertThat(batch.get(m1.getId()).get(0).emoji()).isEqualTo("👍");
+        assertThat(batch.get(m2.getId()).get(0).emoji()).isEqualTo("❤️");
+    }
+
+    @Test
+    void deletingMessageRemovesReactions() {
+        var alice = newUser("alice");
+        var bob = newUser("bob");
+        var room = channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice);
+        channels.join(room, bob);
+        var msg = messages.post(room, alice, "hi");
+        reactions.addReaction(msg.getId(), bob, "👍");
+        em.flush();
+        var reactionId = reactionRepo.findByMessageOrderByCreatedAtAsc(msg).get(0).getId();
+
+        messages.delete(msg.getId(), alice);
+        em.flush();
+
+        assertThat(reactionRepo.findById(reactionId)).isEmpty();
+    }
+
+    /**
+     * Inverted, deliberately. This test used to assert that the author was refused, on the stated
+     * grounds that the refusal matched Slack and Mattermost. It does not — both products allow it,
+     * and so does this one now. Kept rather than deleted because the assertion is what pins the
+     * behaviour down: the author's own reaction is a real row, counted, and {@code mine} to them.
+     */
+    @Test
+    void authorCanReactToOwnMessage() {
+        var alice = newUser("alice");
+        var msg = messages.post(
+                channels.create("r-" + SEQ.incrementAndGet(), null, ChannelType.PUBLIC, alice),
+                alice, "hi");
+        em.flush();
+
+        reactions.addReaction(msg.getId(), alice, "✅");
+        em.flush();
+
+        var groups = reactions.groupingsFor(msg, alice);
+        assertThat(groups).hasSize(1);
+        assertThat(groups.get(0).emoji()).isEqualTo("✅");
+        assertThat(groups.get(0).count()).isEqualTo(1);
+        assertThat(groups.get(0).mine()).isTrue();
+        assertThat(groups.get(0).usernames()).containsExactly(alice.getUsername());
+    }
+}

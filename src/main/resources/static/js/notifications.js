@@ -1,0 +1,432 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+/*
+ * Mention notifications: in-tab toast stack + (when permitted) OS notifications via the
+ * Notification API. The toast always shows so the user gets feedback even when permission
+ * is denied or unavailable; OS notification is opportunistic and additive.
+ *
+ * Permission strategy: don't prompt up-front. Wait until the first mention arrives, then
+ * include an "Enable desktop alerts" button on the toast. Subsequent toasts skip the prompt.
+ *
+ * Public surface: window.MentionNotifications = {
+ *   show({ author, channel, snippet, url, kind }),
+ *       kind: undefined (a mention) | 'thread' | 'channel' | 'direct' | 'group'
+ *   playChime, soundEnabled, setSoundEnabled, permissionState, dndActive
+ * }
+ *
+ * Despite the name it now carries direct and group messages too — see headline().
+ */
+(function () {
+  const TOAST_TIMEOUT_MS = 8000;
+  let stack = null;
+  let askedThisSession = false;
+
+  // ---------- Do Not Disturb ----------
+  // The avatar menu has offered a DND state since presence shipped, and until now it was
+  // decorative: the dot went red and every toast, chime and desktop banner arrived exactly as
+  // before. A promise the product makes and breaks is worse than a feature it never had, because
+  // the only way to discover the breakage is to be interrupted by it.
+  //
+  // The gate lives here rather than at the call sites for two reasons. There are three call
+  // sites today (js/chat/index.js twice, js/conversation.js once) and a fourth arrives the moment
+  // anyone adds a notification kind; and a rule enforced in n places is a rule that holds in n-1
+  // of them within a release. Everything that interrupts goes through show() or playChime(), so
+  // this is the whole surface.
+  //
+  // WHAT DND SUPPRESSES — the three things that reach across the room and take your attention:
+  //   the in-tab toast, the desktop/OS notification, and the sound.
+  //
+  // WHAT IT DELIBERATELY DOES NOT — everything that merely records what happened:
+  //   unread counts and the sidebar's mention badges, the mention inbox behind the bell (the
+  //   call sites ring it before they get here, which is the right order), the server broadcast
+  //   that keeps both correct, and the messages themselves.
+  //
+  // That split is the one this codebase already draws for a muted channel: muting means stop
+  // telling me, not pretend nothing happened. You are silencing the interruption, not hiding the
+  // information, and turning DND off must leave you with a true picture of what you missed rather
+  // than a quiet hole in it.
+  //
+  // Client-side, and that is the point. The server keeps publishing, so badges, the inbox and the
+  // unread marks stay correct whether or not any tab is listening — and a second device that is
+  // NOT the one you set DND from sees the same suppression, because the state is read from
+  // presence rather than from this tab's localStorage.
+  const dndActive = () => {
+    try {
+      return !!(window.Presence && window.Presence.isDnd && window.Presence.isDnd());
+    } catch (e) {
+      // Fail open. A presence client that has thrown is a bug; a notification system that
+      // silently stops notifying because of one is a worse bug wearing the first one's clothes.
+      return false;
+    }
+  };
+
+  // ---------- Alert sound ----------
+  // Synthesised with the Web Audio API rather than shipped as a file. It is ~40 lines against a
+  // binary asset with a licence to track and a request to serve, it cannot 404, and the CSP does
+  // not have to grant media-src. The cost is that it must be *composed* here rather than chosen,
+  // so it is deliberately plain: two short notes, a rise, quiet.
+  //
+  // Per-device, not per-account, and stored in localStorage: whether you want a noise depends on
+  // the room you are sitting in, not on who you are. Slack and Mattermost both treat it that way.
+  //
+  // Two switches, because they are two different interruptions. A direct message is a person
+  // waiting on you; a mention is your name going past in a room that is talking anyway. Plenty of
+  // people want the first and not the second, and one switch forces them to give up both.
+  const SOUND_KEYS = {
+    mention: 'tforge.notification-sound.mention',
+    conversation: 'tforge.notification-sound.dm',
+  };
+  const LEGACY_SOUND_KEY = 'tforge.notification-sound';
+
+  const soundKeyFor = (kind) =>
+      (kind === 'direct' || kind === 'group') ? SOUND_KEYS.conversation : SOUND_KEYS.mention;
+
+  const soundEnabled = (kind) => {
+    const stored = localStorage.getItem(soundKeyFor(kind));
+    // Fall back to the single switch this replaced, so anyone who had already turned sound off
+    // stays off instead of having it come back on when they upgrade.
+    if (stored === null) return localStorage.getItem(LEGACY_SOUND_KEY) !== 'off';
+    return stored !== 'off';
+  };
+  const setSoundEnabled = (kind, on) =>
+      localStorage.setItem(soundKeyFor(kind), on ? 'on' : 'off');
+
+  let audioCtx = null;
+  // Browsers refuse to start an AudioContext until the page has had a user gesture, and a
+  // context that is not running is silent. Two things follow, and the old version got both wrong.
+  //
+  // Created at load, not on the first gesture. Every channel and conversation is a full page
+  // load, and Chrome starts a context created on a page reached by clicking a same-origin link
+  // already running. Waiting for a gesture on the *new* page instead meant that after clicking
+  // into a channel nothing could sound until you clicked or typed again — a chime that arrived
+  // while you sat reading was dropped without a trace. On a page opened cold (a reload, a
+  // bookmark, the redirect back from Keycloak) the context starts suspended, which costs nothing.
+  //
+  // Resumed on every gesture, not just the first. resume() is only honoured inside one — called
+  // from a WebSocket frame it sits pending until the user next clicks — and a browser can
+  // suspend a running context again later (Safari's 'interrupted'). A once-only listener that
+  // returned early because a context existed never got a second chance to fix either.
+  const ensureAudio = () => {
+    if (audioCtx) return audioCtx;
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return null;
+    try {
+      audioCtx = new Ctx();
+    } catch (e) {
+      audioCtx = null;
+    }
+    return audioCtx;
+  };
+  const unlockAudio = () => {
+    const ctx = ensureAudio();
+    if (ctx && ctx.state !== 'running') ctx.resume().catch(() => {});
+  };
+  ensureAudio();
+  ['pointerdown', 'keydown', 'touchend'].forEach((evt) => {
+    document.addEventListener(evt, unlockAudio, { capture: true, passive: true });
+  });
+  // Coming back to the window is not a gesture, but once the page has had one it is enough to
+  // resume a context the browser suspended while it was in the background.
+  window.addEventListener('focus', unlockAudio);
+
+  // Fifteen voices, synthesised like the original rather than shipped as files — same reasoning:
+  // no binary assets, no licences to track, no media-src in the CSP, nothing to 404. Each is a
+  // short list of [frequency, delay] notes plus a waveform and a decay, which is enough range to
+  // sound different without any of them sounding like an alarm. Gain is tuned per voice
+  // rather than shared: a square wave and a low triangle at the same amplitude are not the
+  // same loudness, and one voice being twice as loud as the rest is how a picker becomes a
+  // trap.
+  //
+  // 'chime' is first and is the default, because it is what everyone already has: changing the
+  // sound under people who never asked for a new one is its own small annoyance.
+  const VOICES = {
+    chime:   { label: 'Chime',   type: 'sine',     decay: 0.22, gain: 0.12,
+               notes: [[880, 0], [1174.66, 0.08]] },
+    ping:    { label: 'Ping',    type: 'sine',     decay: 0.34, gain: 0.10,
+               notes: [[1318.51, 0]] },
+    knock:   { label: 'Knock',   type: 'triangle', decay: 0.13, gain: 0.20,
+               notes: [[196, 0], [147, 0.09]] },
+    marimba: { label: 'Marimba', type: 'triangle', decay: 0.26, gain: 0.13,
+               notes: [[659.25, 0], [783.99, 0.07], [1046.5, 0.14]] },
+    pulse:   { label: 'Pulse',   type: 'square',   decay: 0.10, gain: 0.05,
+               notes: [[523.25, 0], [523.25, 0.13]] },
+    bell:    { label: 'Bell',    type: 'sine',     decay: 0.50, gain: 0.10,
+               notes: [[1046.5, 0], [1567.98, 0.05]] },
+    drop:    { label: 'Drop',    type: 'sine',     decay: 0.24, gain: 0.12,
+               notes: [[880, 0], [587.33, 0.07]] },
+    rise:    { label: 'Rise',    type: 'sine',     decay: 0.24, gain: 0.12,
+               notes: [[523.25, 0], [880, 0.07]] },
+    bloop:   { label: 'Bloop',   type: 'sine',     decay: 0.18, gain: 0.16,
+               notes: [[392, 0], [523.25, 0.06]] },
+    tritone: { label: 'Tri-tone', type: 'sine',    decay: 0.20, gain: 0.11,
+               notes: [[1046.5, 0], [880, 0.06], [698.46, 0.12]] },
+    glass:   { label: 'Glass',   type: 'sine',     decay: 0.16, gain: 0.08,
+               notes: [[1760, 0], [2093, 0.05]] },
+    wood:    { label: 'Wood',    type: 'triangle', decay: 0.12, gain: 0.24,
+               notes: [[130.81, 0]] },
+    sonar:   { label: 'Sonar',   type: 'sine',     decay: 0.55, gain: 0.11,
+               notes: [[440, 0]] },
+    tick:    { label: 'Tick',    type: 'square',   decay: 0.04, gain: 0.04,
+               notes: [[1200, 0]] },
+    arp:     { label: 'Arpeggio', type: 'triangle', decay: 0.22, gain: 0.11,
+               notes: [[523.25, 0], [659.25, 0.05], [783.99, 0.10], [1046.5, 0.15]] },
+  };
+  const DEFAULT_VOICE = 'chime';
+
+  const VOICE_KEYS = {
+    mention: 'tforge.notification-sound.voice.mention',
+    conversation: 'tforge.notification-sound.voice.dm',
+  };
+  const voiceKeyFor = (kind) =>
+      (kind === 'direct' || kind === 'group') ? VOICE_KEYS.conversation : VOICE_KEYS.mention;
+
+  /** Which voice this kind uses. Unknown or missing falls back rather than going silent. */
+  const soundVoice = (kind) => {
+    const stored = localStorage.getItem(voiceKeyFor(kind));
+    return (stored && VOICES[stored]) ? stored : DEFAULT_VOICE;
+  };
+  const setSoundVoice = (kind, name) => {
+    if (VOICES[name]) localStorage.setItem(voiceKeyFor(kind), name);
+  };
+  /** [{name, label}] for building a picker without exporting the synthesis details. */
+  const soundVoices = () => Object.entries(VOICES).map(([name, v]) => ({ name, label: v.label }));
+
+  /**
+   * Schedule a voice. Returns true when it will be heard — the context was running — and false
+   * when it could not be, so the caller can fall back to another way of making a sound.
+   */
+  const emit = (voiceName, { defer = false } = {}) => {
+    const ctx = ensureAudio();
+    if (!ctx) return false;
+    const v = VOICES[voiceName] || VOICES[DEFAULT_VOICE];
+    const start = () => {
+      // A few ms of lead: a note scheduled at exactly currentTime can lose its attack to the
+      // block that is already rendering.
+      const t0 = ctx.currentTime + 0.02;
+      v.notes.forEach(([freq, delay]) => {
+        const osc = ctx.createOscillator();
+        const gain = ctx.createGain();
+        osc.type = v.type;
+        osc.frequency.value = freq;
+        const at = t0 + delay;
+        // Ramp in over 8ms instead of starting at full gain: a hard start is an audible click.
+        gain.gain.setValueAtTime(0.0001, at);
+        gain.gain.exponentialRampToValueAtTime(v.gain, at + 0.008);
+        gain.gain.exponentialRampToValueAtTime(0.0001, at + v.decay);
+        osc.connect(gain).connect(ctx.destination);
+        osc.start(at);
+        osc.stop(at + v.decay + 0.02);
+      });
+    };
+    if (ctx.state === 'running') {
+      start();
+      return true;
+    }
+    // A preview is the one sound that may wait: it was asked for by the click now resuming the
+    // context, so "late" is a few milliseconds, not whenever the user next touches the page.
+    if (defer) {
+      ctx.resume().then(start).catch(() => {});
+      return false;
+    }
+    // Suspended or interrupted: this one is dropped, not deferred. The old version scheduled the
+    // notes off resume(), and a resume() outside a gesture sits pending until the user next
+    // clicks — so the chime played then, seconds or minutes after the message, attached to
+    // nothing. Late is worse than silent, and silent is what the desktop banner's own sound
+    // covers (see show()). The resume is still asked for, so the next chime can play if the page
+    // has had a gesture by then.
+    ctx.resume().catch(() => {});
+    return false;
+  };
+
+  // One sound per three seconds, whatever the kind. A burst — a busy channel set to ALL, a
+  // thread waking up, someone who sends a thought as six messages — is one event to the person
+  // hearing it, and six chimes back to back is how notification sound gets switched off for good.
+  // Leading edge, so the first message of a burst is the one that sounds. Mattermost uses the
+  // same rule and the same three seconds (utils/notification_sounds.tsx).
+  const CHIME_THROTTLE_MS = 3000;
+  let lastChimeAt = -Infinity;
+
+  /**
+   * Play the sound this kind is configured for, if that kind is switched on at all and the
+   * user is not in Do Not Disturb.
+   *
+   * <p>Gated separately from show() because one call site plays a chime without a toast: a
+   * mention in the channel you are already looking at is worth hearing and not worth
+   * re-drawing on screen. That path must go quiet under DND too.
+   *
+   * @return why it did or did not sound — 'played', 'dnd', 'off', 'throttled', or 'blocked' when
+   *     the sound was wanted but the browser would not let this page make one yet.
+   */
+  const playChime = (kind) => {
+    if (dndActive()) return 'dnd';
+    if (!soundEnabled(kind)) return 'off';
+    const now = performance.now();
+    if (now - lastChimeAt < CHIME_THROTTLE_MS) return 'throttled';
+    // Taken before emit, not after it succeeds: a blocked chime hands its sound to the desktop
+    // banner, and that sound is under the same one-per-three-seconds rule as the chime.
+    lastChimeAt = now;
+    return emit(soundVoice(kind)) ? 'played' : 'blocked';
+  };
+
+  /**
+   * Play a named voice regardless of the on/off switches — for previewing a picker.
+   * Ungated by DND on purpose: this only fires from the settings page, in direct response to
+   * the user choosing a sound, and refusing to play the thing somebody just clicked to hear
+   * is not respecting their focus, it is breaking the control.
+   */
+  const playVoice = (name) => { emit(name, { defer: true }); };
+
+  function ensureStack() {
+    if (stack) return stack;
+    stack = document.createElement('div');
+    stack.className = 'notification-stack';
+    document.body.appendChild(stack);
+    return stack;
+  }
+
+  function permissionState() {
+    if (typeof Notification === 'undefined') return 'unsupported';
+    return Notification.permission; // 'granted' | 'denied' | 'default'
+  }
+
+  /*
+   * What the alert is about. A mention and a direct message are different events and reading
+   * "mentioned you in #a direct message" is how you can tell one template was doing both jobs.
+   *   (default) a mention in a channel
+   *   'thread'  a reply in a thread the reader is in — neither a mention nor ordinary traffic
+   *   'channel' an ordinary message in a channel the reader set to notify on everything
+   *   'direct'  a one-to-one conversation — the room has no name, the sender is the name
+   *   'group'   a named group conversation
+   */
+  function headline({ author, channel, kind }) {
+    if (kind === 'direct') return author + ' sent you a direct message';
+    if (kind === 'group') return author + ' posted in ' + channel;
+    // A reply in a thread the reader has written in. Distinct from both of its neighbours on
+    // purpose: it is not a mention, and "posted in #channel" would send them hunting through the
+    // main feed for a message that is inside a thread.
+    if (kind === 'thread') return author + ' replied to a thread in #' + channel;
+    // Not a mention — an ordinary message in a channel the user set to notify on everything.
+    // Saying "mentioned you" here would be a lie, and the kind of lie that teaches people to
+    // ignore the notification.
+    if (kind === 'channel') return author + ' posted in #' + channel;
+    return author + ' mentioned you in #' + channel;
+  }
+
+  function fireOsNotification({ author, channel, snippet, url, kind }, silent = false) {
+    if (permissionState() !== 'granted') return null;
+    try {
+      const n = new Notification(headline({ author, channel, kind }), {
+        body: snippet || '',
+        tag: 'mention:' + url,        // collapses repeated mentions to the same message
+        renotify: false,
+        silent,
+      });
+      n.onclick = () => {
+        try { window.focus(); } catch (e) {}
+        if (url) window.location.href = url;
+        n.close();
+      };
+      return n;
+    } catch (e) {
+      return null; // Some browsers throw inside iframes / private modes
+    }
+  }
+
+  function buildToast({ author, channel, snippet, url, kind }) {
+    const li = document.createElement('div');
+    li.className = 'notification-toast';
+    li.setAttribute('role', 'status');
+
+    const head = document.createElement('div');
+    head.className = 'notification-toast-head';
+    const headTitle = document.createElement('span');
+    headTitle.className = 'notification-toast-title';
+    headTitle.textContent = headline({ author, channel, kind });
+    const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'notification-toast-close';
+    close.setAttribute('aria-label', 'Dismiss');
+    close.innerHTML = '<svg class="icon icon-sm" aria-hidden="true"><use href="#icon-close"/></svg>';
+    head.append(headTitle, close);
+
+    const body = document.createElement('div');
+    body.className = 'notification-toast-body';
+    body.textContent = snippet || '';
+
+    li.append(head, body);
+
+    // Inline "Enable desktop alerts" CTA — only on first toast of the session AND only when
+    // the browser has neither granted nor blocked us yet.
+    if (!askedThisSession && permissionState() === 'default') {
+      askedThisSession = true;
+      const cta = document.createElement('button');
+      cta.type = 'button';
+      cta.className = 'notification-toast-cta';
+      cta.textContent = 'Enable desktop alerts';
+      cta.addEventListener('click', () => {
+        cta.disabled = true;
+        Notification.requestPermission().then((perm) => {
+          if (perm === 'granted') {
+            // Silent: this message has already had its sound, when the toast arrived.
+            fireOsNotification({ author, channel, snippet, url, kind }, true);
+            cta.remove();
+          } else {
+            cta.textContent = 'Desktop alerts blocked';
+          }
+        });
+      });
+      li.appendChild(cta);
+    }
+
+    let timer = null;
+    const dismiss = () => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      li.classList.add('leaving');
+      setTimeout(() => li.remove(), 200);
+    };
+    close.addEventListener('click', (e) => { e.stopPropagation(); dismiss(); });
+    li.addEventListener('click', () => {
+      if (url) window.location.href = url;
+    });
+    timer = setTimeout(dismiss, TOAST_TIMEOUT_MS);
+    return li;
+  }
+
+  function show(opts) {
+    if (!opts || !opts.author) return;
+    // Ahead of everything, including the toast: DND suppresses all three interruptions or it
+    // suppresses none of them. A silent banner is still a banner across your screen.
+    if (dndActive()) return;
+    ensureStack().appendChild(buildToast(opts));
+    // Independent of the OS-notification permission on purpose. Denying desktop alerts is a
+    // statement about banners, not about sound, and the two are separately useful: the sound is
+    // what reaches you when the window is behind something else.
+    const chime = playChime(opts.kind);
+    // The desktop banner is silent unless the chime could not play. Most desktops give a banner a
+    // sound of their own, so a banner that is not silent is a second noise on top of the chime —
+    // and, with the chime failing on a page that had no gesture yet, it was the *only* noise, which
+    // is how sound could seem to work only once the window was minimised. So: one sound per message.
+    // The chime when it can; the system's when it cannot; none when sound is off, DND is on, or
+    // the throttle has just let one through.
+    fireOsNotification(opts, chime !== 'blocked');
+  }
+
+  window.MentionNotifications = {
+    show, permissionState, playChime, playVoice, dndActive,
+    soundEnabled, setSoundEnabled, soundVoice, setSoundVoice, soundVoices,
+  };
+})();

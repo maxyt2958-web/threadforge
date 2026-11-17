@@ -1,0 +1,173 @@
+services:
+  postgres:
+    image: docker.io/library/postgres:18-alpine
+    environment:
+      POSTGRES_DB: threadforge_db
+      POSTGRES_USER: tforge_role
+      POSTGRES_PASSWORD: tforge_role
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      # Mount at /var/lib/postgresql (not /var/lib/postgresql/data) — required by
+      # postgres:18+, which puts the cluster in a major-version subdirectory so
+      # in-place pg_upgrade --link can run without mount-point boundary issues.
+      # See https://github.com/docker-library/postgres/pull/1259.
+      - threadforge-pg:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tforge_role -d threadforge_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.8
+    # The three --spi-theme flags are the edit loop for keycloak/themes/threadforge: no
+    # resolved-theme cache, no compiled-template cache, and Cache-Control: no-cache instead of the
+    # thirty-day max-age on theme resources (CSS, fonts, the logo). A browser reload is then the
+    # whole cycle — no container restart.
+    #
+    # `start-dev` already defaults this way (measured: a CSS edit is served immediately by a plain
+    # start-dev container, and theme resources come back `no-cache`), so these are belt and braces.
+    # They are here because the dev-profile defaults are not visible from this file: switch the
+    # command to `start` for a production-shaped test and caching silently comes back on, at which
+    # point an explicit flag is the difference between "why is my CSS stale" and a line to delete.
+    # Never carry them to production — see QUICKSTART-MANUAL.md § "Branding the login page".
+    command:
+      - "start-dev"
+      - "--import-realm"
+      - "--spi-theme-cache-themes=false"
+      - "--spi-theme-cache-templates=false"
+      - "--spi-theme-static-max-age=-1"
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_HTTP_PORT: 8080
+      # The address the *browser* reaches Keycloak at — it lands in the issuer claim and in every
+      # URL Keycloak hands the browser, so it cannot stay loopback once anything but this host
+      # signs in. Override in .env (KC_HOSTNAME=http://<lan-ip>:8081) rather than editing here;
+      # podman-compose does not merge `environment` from compose.override.yml, only lists.
+      KC_HOSTNAME: ${KC_HOSTNAME:-http://localhost:8081}
+      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
+    ports:
+      - "127.0.0.1:8081:8080"
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/realm.json:ro
+      # Custom login theme. `themes/` is the whole directory Keycloak scans, so the mount is the
+      # parent, not themes/threadforge — that way adding a second theme needs no compose change.
+      # Flags, all three load-bearing under rootless Podman:
+      #   ro  the server only ever reads it
+      #   Z   private SELinux relabel; without it the container gets EACCES on an enforcing host
+      #
+      # Deliberately NO `U`. That flag chowns the source to the container's remapped UID, which is
+      # needed when the container must WRITE — Keycloak only reads a theme. What it costs is that
+      # the files stop being yours to edit, and the moment anyone hands them back
+      # (`podman unshare chown`), the container loses access and Keycloak silently falls back to
+      # its built-in theme: the login page keeps working, just unbranded, and the only evidence is
+      # a "Failed to find LOGIN theme" line in its log. Read access needs no ownership at all —
+      # the files are world-readable, which is the whole requirement.
+      - ./keycloak/themes:/opt/keycloak/themes:ro
+
+  # Optional secret backend. Profile-gated so the default `podman compose up -d` skips it —
+  # only `podman compose --profile openbao up -d` brings it online. The app itself works
+  # fine without OpenBao (env-var → application.yml default chain handles credentials);
+  # this service is here for operators who want to test the Vault integration locally.
+  #
+  # Dev mode: in-memory storage, single root token. Don't ship this to prod — replace with
+  # a sealed deployment + auto-unseal + AppRole/k8s auth as your real secret manager.
+  openbao:
+    image: docker.io/openbao/openbao:latest
+    profiles: ["openbao"]
+    command: ["server", "-dev"]
+    environment:
+      BAO_DEV_ROOT_TOKEN_ID: threadforge-dev-token
+      BAO_DEV_LISTEN_ADDRESS: 0.0.0.0:8200
+      BAO_ADDR: http://0.0.0.0:8200
+    ports:
+      - "127.0.0.1:8200:8200"
+    cap_add:
+      # IPC_LOCK lets OpenBao call mlock() so unsealed secret material isn't swapped to disk.
+      # Required on Linux; without it the dev server logs a warning and runs with reduced
+      # protection (still fine for local-dev experimentation).
+      - IPC_LOCK
+    healthcheck:
+      test: ["CMD", "bao", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # TURN relay for 1:1 voice and video calls. Started by the plain `podman compose up -d`, so the
+  # quick start gets working calls without a second command — the app still needs the two matching
+  # env vars, which the quick start exports alongside KEYCLOAK_CLIENT_SECRET.
+  #
+  # The app is not in the media path. It relays SDP and ICE candidates over its own WebSocket;
+  # the audio and video go through here, and coturn forwards encrypted UDP without being able
+  # to read any of it. With tforge.calls.force-relay on (the default) every call comes this way,
+  # so no TURN server means no calls — which is why CallProperties.isConfigured() reports the
+  # feature as unavailable until TFORGE_TURN_URLS and TFORGE_TURN_SECRET are both set.
+  #
+  # In the shell that runs the app:
+  #   export TFORGE_TURN_URLS=turn:127.0.0.1:3478?transport=udp
+  #   export TFORGE_TURN_SECRET=dev-turn-secret
+  # Then sign in as alice and bob in two browsers on http://localhost:8080, open a direct message
+  # and press the call button. It must be localhost: getUserMedia needs a secure context, and
+  # localhost is the only origin exempt from the HTTPS requirement — over a LAN IP the camera and
+  # microphone are blocked outright, with no prompt and no obvious error.
+  coturn:
+    image: docker.io/coturn/coturn:4.18
+    # Host networking rather than published ports, because a relay needs a range of UDP ports
+    # and asking podman to map forty of them makes `up` take visibly longer for no benefit on a
+    # machine where the relay is only ever reached from the same host. A production deployment
+    # runs coturn on the host anyway — see QUICKSTART-MANUAL.md.
+    network_mode: host
+    command:
+      - "-n"                         # no config file; everything is on this line
+      - "--log-file=stdout"
+      - "--listening-port=3478"
+      # All three addresses share one knob, and it defaults to loopback on purpose. This container
+      # starts by default and its shared secret is published two lines below, so binding it to
+      # 0.0.0.0 would put an open relay with a known password on every interface of every machine
+      # that runs the quick start — on a cloud VM, a public one. Loopback is also exactly what the
+      # quick start needs, since two browsers on this host are the only clients that can place a
+      # call anyway (getUserMedia is blocked off localhost).
+      #
+      # Set TFORGE_TURN_RELAY_IP to a LAN or public address to reach it from another device — and
+      # set TFORGE_TURN_SECRET to something unguessable in the same breath, because the default
+      # below stops being a dev convenience the moment the relay is reachable.
+      - "--listening-ip=${TFORGE_TURN_RELAY_IP:-127.0.0.1}"
+      - "--relay-ip=${TFORGE_TURN_RELAY_IP:-127.0.0.1}"
+      - "--external-ip=${TFORGE_TURN_RELAY_IP:-127.0.0.1}"
+      - "--min-port=49160"
+      - "--max-port=49200"
+      - "--realm=threadforge.local"
+      - "--fingerprint"
+      # The REST-API credential scheme: no user database, no accounts to provision. The app mints
+      # `<expiry>:<username>` signed with this secret (TurnCredentialService) and coturn recomputes
+      # the same HMAC to check it. The two MUST match — a mismatch looks exactly like a network
+      # problem, because every candidate pair simply fails to authenticate.
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TFORGE_TURN_SECRET:-dev-turn-secret}"
+      # Dev only. There are no certificates here, so this speaks plain TURN. Production wants
+      # TURNS on a TLS port — ideally 443, which is the one that survives a corporate firewall
+      # because on the wire it is indistinguishable from HTTPS.
+      - "--no-tls"
+      - "--no-dtls"
+      - "--no-cli"
+      # A relay on the public internet with no restrictions is a tool for reflecting traffic at
+      # third parties. These are the standard minimum: no multicast peers, and no link-local.
+      - "--no-multicast-peers"
+      - "--denied-peer-ip=169.254.0.0-169.254.255.255"
+      # Required for the loopback default above, and dev-only. In a relayed 1:1 call each browser
+      # allocates on coturn and then asks it for permission to send to the *other* allocation — so
+      # with --relay-ip=127.0.0.1 the peer address is loopback, which coturn refuses out of the box
+      # (403 Forbidden IP) and the call silently never connects.
+      #
+      # It is safe here only because the relay accepts nothing but loopback clients, who can already
+      # reach loopback directly. Set TFORGE_TURN_RELAY_IP to a reachable address and this flag turns
+      # into a way for remote clients to relay into this host's own 127.0.0.1 — Postgres on 5432,
+      # Keycloak on 8081, the app itself. Exposing this service means dropping this line and setting
+      # a real --static-auth-secret, and at that point see QUICKSTART-MANUAL.md and run coturn on
+      # the host properly instead.
+      - "--allow-loopback-peers"
+
+volumes:
+  threadforge-pg:

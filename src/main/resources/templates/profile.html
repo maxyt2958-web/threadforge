@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org" xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+    <meta name="theme-color" content="#18181b"/>
+    <title th:text="'Profile · ' + ${appTitle}">Profile · ThreadForge</title>
+    <link rel="icon" th:href="${appFaviconUrl}"/>
+    <th:block th:replace="~{fragments/assets :: css('app')}"/>
+    <meta name="_csrf" th:content="${_csrf != null ? _csrf.token : ''}"/>
+    <meta name="_csrf_header" th:content="${_csrf != null ? _csrf.headerName : ''}"/>
+    <th:block th:replace="~{fragments/time-prefs :: metas}"/>
+    <!-- Workspace-admin flag (realm role tforge-admin -> ROLE_ADMIN); read by the avatar
+         dropdown to decide whether to offer the Admin console item. Distinct from the
+         channel-scoped me-is-admin meta on the chat pages. -->
+    <meta name="me-is-workspace-admin" sec:authorize="hasRole('ADMIN')" content="true"/>
+</head>
+<body class="app profile-page" th:attr="data-theme=${me.theme}">
+
+<th:block th:replace="~{fragments/icon-sprite :: sprite}"/>
+
+<header class="topbar">
+    <div class="topbar-left">
+        <a th:href="@{/channels}" class="logo">
+            <th:block th:replace="~{fragments/logo :: mark('logo-mark')}"/>
+            <span class="logo-text" th:text="${appTitle}">ThreadForge</span>
+        </a>
+    </div>
+    <div class="topbar-center"></div>
+    <div class="topbar-right">
+        <a th:href="@{/channels}" class="link-btn">Back to channels</a>
+        <span class="me">
+            <span class="avatar" th:data-author="${me.username}">
+                <img th:if="${me.hasAvatar()}" class="avatar-image" alt=""
+                     th:src="@{/api/users/{u}/avatar(u=${me.username},v=${me.avatarVersion()})}"/>
+                <span class="avatar-letter"
+                      th:text="${#strings.toUpperCase(#strings.substring(me.displayName ?: me.username, 0, 1))}">U</span>
+            </span>
+            <span th:text="${me.displayName ?: me.username}">user</span>
+        </span>
+        <!-- Submitted by the avatar dropdown's "Sign out" item (presence-menu.js). -->
+        <form id="logout-form" th:action="@{/logout}" method="post" hidden></form>
+    </div>
+</header>
+
+<main class="profile-content">
+    <div class="profile-card">
+        <h1>Profile settings</h1>
+
+        <section class="profile-section">
+            <h2>Profile picture</h2>
+            <div class="avatar-editor">
+                <span class="avatar avatar-large" id="avatar-preview" th:data-author="${me.username}">
+                    <img th:if="${me.hasAvatar()}" class="avatar-image" alt=""
+                         th:src="@{/api/users/{u}/avatar(u=${me.username},v=${me.avatarVersion()})}"/>
+                    <span class="avatar-letter"
+                          th:text="${#strings.toUpperCase(#strings.substring(me.displayName ?: me.username, 0, 1))}">U</span>
+                </span>
+                <div class="avatar-editor-controls">
+                    <p class="profile-help">PNG, JPEG, WEBP, or GIF. Up to 5 MiB.</p>
+                    <div class="avatar-editor-buttons">
+                        <input type="file" id="avatar-file" accept="image/png,image/jpeg,image/webp,image/gif" hidden/>
+                        <button type="button" id="avatar-upload-btn">Upload picture</button>
+                        <button type="button" id="avatar-clear-btn"
+                                th:disabled="${!me.hasAvatar()}">Remove</button>
+                    </div>
+                    <p id="avatar-status" class="profile-help" hidden></p>
+                </div>
+            </div>
+        </section>
+
+        <section class="profile-section" id="status-section">
+            <h2>Status</h2>
+            <p class="profile-help">
+                Let teammates know what you're up to. Pairs with the green/grey dot on your avatar.
+            </p>
+            <form id="status-form" class="status-form">
+                <div class="status-form-row">
+                    <input type="text" id="status-emoji" name="emoji" maxlength="16"
+                           placeholder="🍕" autocomplete="off"/>
+                    <input type="text" id="status-text" name="text" maxlength="120"
+                           placeholder="What's on your mind?" autocomplete="off"/>
+                </div>
+                <div class="status-form-row">
+                    <label>
+                        Clear after
+                        <select id="status-clear-after">
+                            <option value="0">Don't auto-clear</option>
+                            <option value="30">30 minutes</option>
+                            <option value="60">1 hour</option>
+                            <option value="240">4 hours</option>
+                            <option value="1440">Today</option>
+                        </select>
+                    </label>
+                    <button type="submit" id="status-set-btn">Set status</button>
+                    <button type="button" id="status-clear-btn" class="link-btn">Clear status</button>
+                </div>
+                <p id="status-feedback" class="profile-help" hidden></p>
+            </form>
+        </section>
+
+        <!--/* Stored in localStorage, not on the account, so it is per device: whether you want
+               a noise depends on the room you are sitting in, not on who you are. Rendered
+               unchecked and corrected by profile.js on load, because the server does not know
+               the answer and a checkbox that flips after paint is better than one that lies. */-->
+        <section class="profile-section">
+            <h2>Notifications</h2>
+            <p class="profile-help">
+                Applies to this browser only. Mentions and direct messages always show a toast —
+                these control whether they also make a sound, and which one. A direct message is
+                someone waiting on you; a mention is your name going past in a room that is talking
+                anyway — so they get their own switch and their own sound, and you can tell them
+                apart without looking.
+            </p>
+            <div class="notify-default">
+                <label for="notify-default-level">Notify me about</label>
+                <select id="notify-default-level" th:data-current="${me.notifyDefault}">
+                    <option value="ALL" th:selected="${me.notifyDefault.name() == 'ALL'}">Every message</option>
+                    <option value="MENTIONS" th:selected="${me.notifyDefault.name() == 'MENTIONS'}">Mentions only</option>
+                    <option value="NONE" th:selected="${me.notifyDefault.name() == 'NONE'}">Nothing</option>
+                </select>
+                <p class="profile-help">
+                    The starting point for every channel. A channel set to anything other than
+                    <em>Default</em> keeps its own setting; the rest follow this one, so changing
+                    it here moves them all. Unlike the sounds below, this is saved to your account
+                    and applies wherever you sign in.
+                </p>
+            </div>
+
+            <!--/* Direct messages get their own default, because the same words mean different
+                   things in the two places. "Mentions only" is a sensible way to follow a channel
+                   you joined and a broken way to receive a message somebody sent to you alone —
+                   nobody types your name in a 1:1, they just talk to you. Keeping one control for
+                   both is what forced the conversation path to ignore "mentions only" entirely,
+                   which in turn made it impossible to say "only when someone names me" about a
+                   twenty-person group DM. Two defaults, both honest. */-->
+            <div class="notify-default">
+                <label for="notify-dm-default-level">Notify me about direct messages</label>
+                <select id="notify-dm-default-level" th:data-current="${me.notifyDmDefault}">
+                    <option value="ALL" th:selected="${me.notifyDmDefault.name() == 'ALL'}">Every message</option>
+                    <option value="MENTIONS" th:selected="${me.notifyDmDefault.name() == 'MENTIONS'}">Mentions only</option>
+                    <option value="NONE" th:selected="${me.notifyDmDefault.name() == 'NONE'}">Nothing</option>
+                </select>
+                <p class="profile-help">
+                    The starting point for every direct message and group conversation. <em>Every
+                    message</em> is the default and almost certainly what you want: a direct message
+                    is addressed to you whether or not it spells your name. <em>Mentions only</em>
+                    is for people in large group conversations who want them to behave like a busy
+                    channel.
+                </p>
+            </div>
+
+            <div class="sound-prefs">
+                <div class="sound-pref" data-kind="direct">
+                    <label class="notification-sound-toggle">
+                        <input type="checkbox" id="notification-sound-dm"/>
+                        <span>Direct messages</span>
+                    </label>
+                    <select id="notification-voice-dm" aria-label="Sound for direct messages"></select>
+                </div>
+                <div class="sound-pref" data-kind="mention">
+                    <label class="notification-sound-toggle">
+                        <input type="checkbox" id="notification-sound-mention"/>
+                        <span>Mentions</span>
+                    </label>
+                    <select id="notification-voice-mention" aria-label="Sound for mentions"></select>
+                </div>
+            </div>
+        </section>
+
+        <section class="profile-section">
+            <h2>Account</h2>
+            <dl class="profile-fields">
+                <dt>Username</dt><dd th:text="${me.username}">user</dd>
+                <dt>Display name</dt><dd th:text="${me.displayName ?: '—'}">name</dd>
+                <dt>Email</dt><dd th:text="${me.email ?: '—'}">email</dd>
+            </dl>
+        </section>
+
+        <!--/* The zone does two jobs and the help text used to admit only one of them. It is what
+               wall-clock times you *type* are resolved in — "/remind me at 14:00" above all — and
+               it is now also the zone every timestamp you *read* is rendered in, on the server as
+               well as in the browser. Before, the server rendered message times in its own zone
+               with a US 12-hour pattern while the browser rendered live ones locally, so the same
+               feed carried two clocks. The effective zone is shown whether or not it was chosen
+               here, because a guess you cannot see is a guess you cannot correct. */-->
+        <section class="profile-section" id="timezone-section">
+            <h2>Time zone</h2>
+            <p class="profile-help">
+                Message times are shown in this zone, and times you type are read in it —
+                <code>/remind me at 14:00</code> means 14:00 here.
+            </p>
+            <form th:action="@{/profile/timezone}" method="post" id="timezone-form">
+                <!--/* The caption is visually hidden because the section's own <h2> already says
+                       "Time zone" directly above it, and two identical labels a line apart read as
+                       a rendering bug. It stays in the DOM so the control keeps an accessible name
+                       — a screen reader lands on the input without the heading for context. */-->
+                <label class="timezone-picker" for="timezone-select">
+                    <span class="visually-hidden">Time zone</span>
+                    <select id="timezone-select" name="zone">
+                        <!--/* "Automatic" is a real setting, not the absence of one: it keeps
+                               following the browser, so it stays right when you travel. The label
+                               names what it currently resolves to, so the option is not a leap of
+                               faith. */-->
+                        <option value="" th:selected="${!zoneIsChosen}"
+                                th:text="${'Automatic — follow this device'
+                                            + (zoneIsChosen ? '' : ' (' + effectiveZone + ')')}">
+                            Automatic
+                        </option>
+                        <option th:each="z : ${zones}" th:value="${z}" th:text="${z}"
+                                th:selected="${zoneIsChosen and z == me.zoneId}">Europe/Oslo</option>
+                    </select>
+                </label>
+                <p class="profile-help">
+                    Currently using <strong th:text="${effectiveZone}">UTC</strong><span
+                        th:text="${zoneSource == 'chosen' ? ' — your choice.'
+                                   : (zoneSource == 'detected' ? ' — detected from this browser.'
+                                   : (zoneSource == 'account' ? ' — reported by your account.'
+                                   : (zoneSource == 'locale' ? ' — guessed from your browser’s language.'
+                                                             : ' — this server’s default; we could not tell.')))}">.</span>
+                </p>
+                <p id="timezone-feedback" class="profile-help" hidden></p>
+            </form>
+        </section>
+
+        <!--/* Clock and date order. Separate from the zone because they are separate questions:
+               knowing somebody is in Oslo does not tell you they want a 24-hour clock, and a great
+               many people read the interface in English from somewhere that has never used a
+               12-hour one. "Automatic" follows the browser's language, which is right often enough
+               to be the default and wrong often enough to need this. Samples under each control,
+               because a format is far easier to recognise than to read off a name. */-->
+        <section class="profile-section" id="time-format-section">
+            <h2>Date and time format</h2>
+            <p class="profile-help">
+                How times and dates are written. Automatic follows your browser’s language.
+            </p>
+            <form th:action="@{/profile/time-format}" method="post" id="time-format-form">
+                <label class="timezone-picker" for="hour-cycle-select">
+                    Clock
+                    <select id="hour-cycle-select" name="hourCycle">
+                        <option th:each="h : ${hourCycles}" th:value="${h}"
+                                th:selected="${h == me.hourCycle}"
+                                th:text="${h.name() == 'AUTO' ? 'Automatic'
+                                           : (h.name() == 'H24' ? '24-hour (14:05)' : '12-hour (2:05 PM)')}">
+                            Automatic
+                        </option>
+                    </select>
+                </label>
+                <label class="timezone-picker" for="date-style-select">
+                    Date
+                    <select id="date-style-select" name="dateStyle">
+                        <option th:each="d : ${dateStyles}" th:value="${d}"
+                                th:selected="${d == me.dateStyle}"
+                                th:text="${d.name() == 'AUTO' ? 'Automatic'
+                                           : (d.name() == 'DMY' ? 'Day first (3 Feb 2026)'
+                                           : (d.name() == 'MDY' ? 'Month first (Feb 3, 2026)'
+                                                                : 'ISO (2026-02-03)'))}">
+                            Automatic
+                        </option>
+                    </select>
+                </label>
+                <p class="profile-help">
+                    Right now that reads
+                    <strong th:text="${fmt.dateTime(sampleNow)}">3 Feb 2026, 14:05</strong>.
+                </p>
+                <p id="time-format-feedback" class="profile-help" hidden></p>
+            </form>
+        </section>
+
+        <section class="profile-section">
+            <h2>Theme</h2>
+            <p class="profile-help">
+                Click a theme to apply it — your choice is saved automatically.
+            </p>
+            <form th:action="@{/profile/theme}" method="post" class="theme-picker"
+                  id="theme-form">
+                <div class="theme-grid">
+                    <label th:each="t : ${themes}" class="theme-option"
+                           th:classappend="${t == me.theme ? 'selected' : ''}"
+                           th:data-theme-value="${t}">
+                        <input type="radio" name="theme" th:value="${t}"
+                               th:checked="${t == me.theme}"/>
+                        <span class="theme-swatch" th:attr="data-theme=${t}">
+                            <span class="sw sw-sidebar"></span>
+                            <span class="sw sw-accent"></span>
+                            <span class="sw sw-content"></span>
+                        </span>
+                        <span class="theme-name" th:text="${#strings.capitalize(t)}">Theme</span>
+                    </label>
+                </div>
+                <p id="theme-feedback" class="profile-help" hidden></p>
+            </form>
+        </section>
+    </div>
+</main>
+
+<!-- Bundled page scripts (assets.gradle); dev serves the source files. See ASSETS.md. -->
+<th:block th:replace="~{fragments/assets :: js('profile')}"/>
+<!-- Avatar dropdown (presence + sign out); ES module, outside the Closure bundle. -->
+<script type="module" th:src="@{/js/chat/presence-menu-boot.js}" defer></script>
+
+</body>
+</html>

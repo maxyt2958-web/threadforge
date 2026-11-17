@@ -1,0 +1,430 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.threadforge.chat.repository;
+
+import com.threadforge.chat.domain.Channel;
+import com.threadforge.chat.domain.Message;
+import com.threadforge.chat.domain.User;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.Modifying;
+import org.springframework.data.jpa.repository.Query;
+import org.springframework.data.repository.query.Param;
+
+import java.time.Instant;
+import java.util.Collection;
+import java.util.List;
+import java.util.Optional;
+
+
+/**
+ * <h2>Soft delete</h2>
+ *
+ * A message with {@code deletedAt} set is invisible, not gone: the row survives until the
+ * retention purge so a mistaken "clear everything this account wrote" can be undone. That only
+ * holds if <b>every</b> reading query filters it out, and the filter lives here rather than in the
+ * services because the readers are spread across {@code MessageService}, {@code SearchService},
+ * {@code ReactionService}, {@code ReadStateService}, {@code SidebarService} and the Lucene
+ * bootstrap — one missed call site and a purged message reappears somewhere.
+ *
+ * <p>The methods that deliberately <b>include</b> deleted rows say so in their name
+ * ({@code ...IncludingDeleted}) or in their javadoc; treat that as the exception list. The bare
+ * {@link JpaRepository#findById} inherited from Spring Data is also unfiltered — it is used by
+ * moderation and by cascade cleanup, so callers on a read path must use one of the fetching
+ * finders below instead.
+ */
+public interface MessageRepository extends JpaRepository<Message, Long> {
+
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.id = :id and m.deletedAt is null
+            """)
+    Optional<Message> findByIdWithAuthor(Long id);
+
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            join fetch m.channel
+            where m.id = :id and m.deletedAt is null
+            """)
+    Optional<Message> findByIdWithChannelAndAuthor(Long id);
+
+    /** Channel is join-fetched as well as the author: search results render the channel's name,
+     *  and the reconcile sweeps read its id, both after the transaction has closed. */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            join fetch m.channel
+            where m.id in :ids and m.deletedAt is null
+            """)
+    List<Message> findAllByIdWithAuthor(@Param("ids") Collection<Long> ids);
+
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.channel = :channel and m.parent is null and m.deletedAt is null
+            order by m.createdAt desc, m.id desc
+            """)
+    List<Message> findByChannelAndParentIsNullOrderByCreatedAtDesc(Channel channel, Pageable pageable);
+
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.channel = :channel and m.parent is null and m.deletedAt is null
+              and m.createdAt < :before
+            order by m.createdAt desc, m.id desc
+            """)
+    List<Message> findByChannelAndParentIsNullAndCreatedAtBeforeOrderByCreatedAtDesc(
+            Channel channel, Instant before, Pageable pageable);
+
+    /** Mirror of {@link #findByChannelAndParentIsNullAndCreatedAtBeforeOrderByCreatedAtDesc} but
+     * paging FORWARD from a timestamp. */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.channel = :channel and m.parent is null and m.deletedAt is null
+              and m.createdAt > :after
+            order by m.createdAt asc, m.id asc
+            """)
+    List<Message> findByChannelAndParentIsNullAndCreatedAtAfterOrderByCreatedAtAsc(
+            Channel channel, Instant after, Pageable pageable);
+
+    /** Composite-keyset "before the anchor": messages strictly before (createdAt, id), so a
+     *  message sharing the anchor's exact timestamp is ordered by id rather than dropped. Used by
+     *  {@code around()} — see BUG-20. */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.channel = :channel and m.parent is null and m.deletedAt is null
+              and (m.createdAt < :ts or (m.createdAt = :ts and m.id < :id))
+            order by m.createdAt desc, m.id desc
+            """)
+    List<Message> findTopLevelBeforeKeyset(Channel channel, Instant ts, Long id, Pageable pageable);
+
+    /** Composite-keyset "after the anchor": mirror of {@link #findTopLevelBeforeKeyset}. */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.channel = :channel and m.parent is null and m.deletedAt is null
+              and (m.createdAt > :ts or (m.createdAt = :ts and m.id > :id))
+            order by m.createdAt asc, m.id asc
+            """)
+    List<Message> findTopLevelAfterKeyset(Channel channel, Instant ts, Long id, Pageable pageable);
+
+    /**
+     * The channel's pins. {@code left join fetch m.pinnedBy} is what lets the DTO say who pinned
+     * each one: this is the only query that fetches that association, so {@code pinnedByUsername}
+     * is populated here and null on the feed paths, which never pay for the join. See
+     * {@code MessageDto#build}.
+     */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            left join fetch m.pinnedBy
+            where m.channel = :channel and m.pinnedAt is not null and m.deletedAt is null
+            order by m.pinnedAt desc
+            """)
+    List<Message> findByChannelAndPinnedAtIsNotNullOrderByPinnedAtDesc(Channel channel);
+
+    @Query("""
+            select count(m) from Message m
+            where m.channel = :channel and m.pinnedAt is not null and m.deletedAt is null
+            """)
+    long countByChannelAndPinnedAtIsNotNull(Channel channel);
+
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.parent = :parent and m.deletedAt is null
+            order by m.createdAt asc
+            """)
+    List<Message> findByParentOrderByCreatedAtAsc(Message parent);
+
+    /**
+     * Every reply to {@code parent}, <b>including soft-deleted ones</b> — the hard-delete path.
+     * {@code messages.parent_id} is {@code on delete cascade}, so removing the parent takes the
+     * replies with it whether or not the application saw them; enumerating them first is what
+     * lets their attachment files and index documents be cleaned up rather than orphaned.
+     */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            where m.parent = :parent
+            order by m.createdAt asc
+            """)
+    List<Message> findRepliesIncludingDeleted(Message parent);
+
+    /** Live replies only — the "N replies" indicator must not count removed ones. */
+    @Query("select count(m) from Message m where m.parent = :parent and m.deletedAt is null")
+    long countByParent(Message parent);
+
+    /**
+     * Live top-level messages in a channel. Annotated rather than left as a derived query so the
+     * soft-delete filter applies: the admin screen's per-channel message count is a "what is in
+     * this channel" figure, and it should drop when an admin clears an account's messages.
+     */
+    @Query("""
+            select count(m) from Message m
+            where m.channel = :channel and m.parent is null and m.deletedAt is null
+            """)
+    long countByChannelAndParentIsNull(Channel channel);
+
+    /**
+     * All message ids in a channel, <b>including soft-deleted ones</b> — captured before channel
+     * deletion to purge the Lucene index. Unfiltered on purpose: the channel and every row in it
+     * are about to be hard-deleted, so anything left in the index would be a permanently stale doc.
+     */
+    @Query("select m.id from Message m where m.channel = :channel")
+    List<Long> findIdsByChannel(Channel channel);
+
+    /** Flat (id, channelId, authorUsername, bodyMarkdown) projection, keyset-paged by id — used by
+     *  the Lucene bootstrap to stream the whole table without materialising entities (BUG-24).
+     *  Skips soft-deleted rows so a rebuild can't resurrect them into search. */
+    @Query("select m.id, m.channel.id, m.author.username, m.bodyMarkdown from Message m "
+           + "where m.id > :afterId and m.deletedAt is null order by m.id asc")
+    List<Object[]> findIndexRowsAfter(Long afterId, Pageable pageable);
+
+    /**
+     * For each given parent id, count its top-level replies. Parents with zero replies are
+     * absent from the result. Used to render the "N replies" thread indicator on a feed
+     * of top-level messages without N+1 queries.
+     */
+    @Query("""
+            select m.parent.id, count(m)
+            from Message m
+            where m.parent.id in :parentIds and m.deletedAt is null
+            group by m.parent.id
+            """)
+    List<Object[]> countRepliesByParentIds(@Param("parentIds") Collection<Long> parentIds);
+
+    /**
+     * For each channel id, count messages that arrived after the viewer's last_read_at marker (no
+     * marker counts as "all unread"). Excludes the viewer's own messages — you don't generate unread
+     * counts for yourself.
+     *
+     * <p><b>Thread replies count.</b> This used to filter {@code parent_id is null}, which made a
+     * reply invisible to every unread signal the application has: no badge, no bold name, and — with
+     * no @mention in it — no bell entry either. A reply to your own thread produced literally zero
+     * indication anywhere, which is how a threaded conversation dies without anyone deciding to end
+     * it. A reply is a message in the channel and the channel is unread; there is no reading of
+     * "unread" under which that was true.
+     *
+     * <p>A reply is <em>ordinary</em> unread, not a mention: it bolds the channel name and does not
+     * put a number on it (see {@code ChannelSidebarDto.unreadCue}). Who gets told about it beyond
+     * the badge is a separate question, answered by thread participation — see
+     * {@link #findThreadParticipants}.
+     */
+    @Query(value = """
+            select msg.channel_id, count(*)
+              from messages msg
+              left join channel_reads cr
+                     on cr.channel_id = msg.channel_id and cr.user_id = :userId
+             where msg.channel_id in (:channelIds)
+               and msg.deleted_at is null
+               and msg.author_id <> :userId
+               and (cr.last_read_at is null or msg.created_at > cr.last_read_at)
+             group by msg.channel_id
+            """, nativeQuery = true)
+    List<Object[]> countUnreadPerChannel(@Param("userId") Long userId,
+                                         @Param("channelIds") Collection<Long> channelIds);
+
+    /**
+     * Everyone in a thread: {@code (userId, username)} for the parent's author plus everyone who has
+     * replied to it. Live rows only, and the parent itself is included by the {@code m.id} arm.
+     *
+     * <p>Derived rather than stored. A follow/subscribe table would need a row written on every
+     * reply, a decision about what "unfollow" means, backfill for every thread that already exists,
+     * and a migration — to express something the messages already say. "The people in this thread"
+     * is exactly the set of people who wrote in it, which is also the set people expect to be
+     * notified, so the derived answer is not an approximation of the stored one; it <em>is</em> the
+     * answer.
+     *
+     * <p>Duplicates are collapsed here rather than by the caller because someone who replied five
+     * times is one participant.
+     */
+    @Query("""
+            select distinct m.author.id, m.author.username
+              from Message m
+             where (m.id = :parentId or m.parent.id = :parentId)
+               and m.deletedAt is null
+            """)
+    List<Object[]> findThreadParticipants(@Param("parentId") Long parentId);
+
+    /**
+     * Every <b>live</b> message id — the DB side of the Lucene↔DB reconcile (CLEAN-3).
+     *
+     * <p>Filtering here is what makes the reconcile the backstop for soft-delete rather than its
+     * enemy. A soft-deleted message keeps its row; if this returned it, the reconcile would see a
+     * DB row with no index doc, classify it "missing" and re-index it — putting removed messages
+     * back into search an hour after an admin removed them. Excluded, the same sweep classifies a
+     * leftover doc as "stale" and drops it, healing any post-commit index delete that was lost.
+     */
+    @Query("select m.id from Message m where m.deletedAt is null")
+    List<Long> findAllMessageIds();
+
+    /** Flat (id, channelId, authorUsername, bodyMarkdown) rows for one author — used to reindex
+     *  their messages when their username changes so search-by-author stays correct (N23).
+     *  Live rows only: reindexing a removed message would put it back into search. */
+    @Query("select m.id, m.channel.id, m.author.username, m.bodyMarkdown from Message m "
+           + "where m.author.id = :authorId and m.deletedAt is null")
+    List<Object[]> findIndexRowsByAuthor(Long authorId);
+
+    // ------------------------------------------------------------------ moderation ----
+    // Everything below deliberately sees deleted rows: it is the code that sets, clears and
+    // finally reaps the flag the read paths above filter on.
+
+    /**
+     * Load a message whether or not it has been removed — the only supported way to reach a
+     * soft-deleted row by id. Author and channel are join-fetched because the moderation paths
+     * need both (audit target, index document) after the transaction closes.
+     */
+    @Query("""
+            select m from Message m
+            join fetch m.author
+            join fetch m.channel
+            where m.id = :id
+            """)
+    Optional<Message> findByIdIncludingDeleted(Long id);
+
+    /**
+     * One keyset page of an author's <b>live</b> message ids. Keyset rather than offset so the
+     * caller's delete-as-it-goes loop can't skip rows: each page starts strictly after the last id
+     * of the previous one, and rows the loop already flagged simply stop matching.
+     */
+    @Query("select m.id from Message m "
+           + "where m.author = :author and m.deletedAt is null and m.id > :afterId order by m.id asc")
+    List<Long> findLiveIdsByAuthorAfter(User author, Long afterId, Pageable pageable);
+
+    /** Keyset page of an author's soft-deleted ids — the undo direction of
+     *  {@link #findLiveIdsByAuthorAfter}. */
+    @Query("select m.id from Message m "
+           + "where m.author = :author and m.deletedAt is not null and m.id > :afterId order by m.id asc")
+    List<Long> findDeletedIdsByAuthorAfter(User author, Long afterId, Pageable pageable);
+
+    /**
+     * Flag a batch of messages as removed in one statement.
+     *
+     * <p>{@code and m.deletedAt is null} makes it idempotent and preserves the original removal
+     * time: re-running a purge must not push every message's {@code deletedAt} forward, because
+     * that timestamp is what the retention window is measured from — refreshing it would keep
+     * resetting the clock and the rows would never be reaped.
+     */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("update Message m set m.deletedAt = :at, m.deletedBy = :by "
+           + "where m.id in :ids and m.deletedAt is null")
+    int softDeleteByIds(@Param("ids") Collection<Long> ids,
+                        @Param("at") Instant at,
+                        @Param("by") User by);
+
+    /** Clear the removal flag on a batch. Idempotent for the same reason as
+     *  {@link #softDeleteByIds}. */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("update Message m set m.deletedAt = null, m.deletedBy = null "
+           + "where m.id in :ids and m.deletedAt is not null")
+    int restoreByIds(@Param("ids") Collection<Long> ids);
+
+    /** Flat index rows for a set of ids, live only — used to put restored messages back into
+     *  Lucene without a second pass over the entities. */
+    @Query("select m.id, m.channel.id, m.author.username, m.bodyMarkdown from Message m "
+           + "where m.id in :ids and m.deletedAt is null")
+    List<Object[]> findIndexRowsByIds(@Param("ids") Collection<Long> ids);
+
+    /**
+     * The other half of the index projection: flat {@code (messageId, filename)} rows for the
+     * <b>live</b> attachments hanging off these messages.
+     *
+     * <p>A separate query rather than a join onto {@link #findIndexRowsByIds} because a message may
+     * carry several files, and joining would multiply the body rows — one document per attachment
+     * instead of one document per message. {@code MessageIndexService.groupFilenames} folds these
+     * rows back onto their messages.
+     *
+     * <p>It lives on this repository, next to the row projection it completes, rather than on
+     * {@code AttachmentRepository} where its root entity is: every caller that needs it already
+     * holds this repository to fetch the bodies, and splitting the pair across two repositories
+     * would mean injecting one of them into four more classes to say the same thing.
+     *
+     * <p>{@code deletedAt is null} is the tombstone rule: a file the uploader removed from the file
+     * manager keeps its row (the message says who deleted it) but must stop being findable.
+     */
+    @Query("select a.message.id, a.filename from Attachment a "
+           + "where a.message.id in :ids and a.deletedAt is null "
+           + "order by a.createdAt asc, a.id asc")
+    List<Object[]> findIndexFilenamesByIds(@Param("ids") Collection<Long> ids);
+
+    /** {@link #findIndexFilenamesByIds} for a single message — the write path's edit/attach hooks. */
+    @Query("select a.filename from Attachment a "
+           + "where a.message.id = :messageId and a.deletedAt is null "
+           + "order by a.createdAt asc, a.id asc")
+    List<String> findIndexFilenames(@Param("messageId") Long messageId);
+
+    /**
+     * One bounded batch of messages the retention purge may hard-delete: removed before
+     * {@code cutoff}, oldest removal first.
+     *
+     * <p>The {@code not exists} guard is not an optimisation, it is a correctness requirement.
+     * {@code messages.parent_id} is {@code on delete cascade}, so deleting a thread parent deletes
+     * its replies — and an admin who cleared one account's messages will have left that account's
+     * thread parents removed while other people's replies underneath them are still live. Purging
+     * such a parent would silently destroy messages nobody asked to remove, and no soft-delete row
+     * would remain to undo it. Those parents stay until their live replies are gone too.
+     *
+     * <p>Native because JPQL bulk statements can't take a {@code limit}, and an unbounded purge is
+     * exactly the long-running transaction this is designed to avoid.
+     */
+    @Query(value = """
+            select m.id
+              from messages m
+             where m.deleted_at is not null
+               and m.deleted_at < :cutoff
+               and not exists (select 1 from messages r
+                                where r.parent_id = m.id and r.deleted_at is null)
+             order by m.deleted_at
+             limit :limit
+            """, nativeQuery = true)
+    List<Long> findPurgeableIds(@Param("cutoff") Instant cutoff, @Param("limit") int limit);
+
+    /** Hard-delete a batch by id. Dependent rows (attachments, reactions, mentions, polls and
+     *  already-removed replies) go with them via the schema's {@code on delete cascade}. */
+    @Modifying(clearAutomatically = true, flushAutomatically = true)
+    @Query("delete from Message m where m.id in :ids")
+    int deleteByIdIn(@Param("ids") Collection<Long> ids);
+
+    /**
+     * Reply counts for a batch of thread parents, <b>including removed replies</b> — rows of
+     * {@code [parentId, count]}, parents with no replies absent. The unfiltered twin of
+     * {@link #countRepliesByParentIds}, which counts only live replies because it feeds the
+     * "N replies" indicator.
+     *
+     * <p>Used by the file manager to decide whether deleting a file is allowed to take its message
+     * with it. Removed replies count, because the delete that would follow is
+     * {@code MessageService.delete}, and that one takes every reply — soft-deleted included, since
+     * {@code parent_id} cascades — so a parent with only removed replies would still be destroying
+     * rows a moderator is still able to restore.
+     *
+     * <p>An explicit {@code join m.parent p} rather than a {@code m.parent.id} path: the path form
+     * leaves the null-parent case resting on Hibernate choosing the FK column over an implicit inner
+     * join, and here the join is wanted anyway.
+     */
+    @Query("""
+            select p.id, count(m.id) from Message m
+            join m.parent p
+            where p.id in :parentIds
+            group by p.id
+            """)
+    List<Object[]> countRepliesIncludingDeletedByParentIds(@Param("parentIds") Collection<Long> parentIds);
+}

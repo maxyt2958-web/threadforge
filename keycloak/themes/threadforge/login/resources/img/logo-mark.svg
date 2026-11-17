@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ThreadForge">
+  <title>ThreadForge</title>
+  <polygon points="32,4 56,18 56,46 32,60 8,46 8,18" fill="#18181b" stroke="#ea580c" stroke-width="3"/>
+  <path d="M19 23 H45 M32 23 V46" fill="none" stroke="#f97316" stroke-width="6" stroke-linecap="round"/>
+  <path d="M32 34 H43" fill="none" stroke="#fbbf24" stroke-width="4.5" stroke-linecap="round"/>
+  <polygon points="46,15 50,19 46,23 42,19" fill="#fbbf24"/>
+</svg>

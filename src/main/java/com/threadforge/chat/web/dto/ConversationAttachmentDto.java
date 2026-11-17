@@ -1,0 +1,68 @@
+/*
+ * Copyright 2026 ThreadForge
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+package com.threadforge.chat.web.dto;
+
+import com.threadforge.chat.attachments.AttachmentMedia;
+import com.threadforge.chat.attachments.PreviewableAttachments;
+import com.threadforge.chat.domain.ConversationAttachment;
+
+import java.time.Instant;
+
+
+/**
+ * Wire format for files attached to a {@link com.threadforge.chat.domain.ConversationMessage}.
+ * The {@code downloadUrl} is namespaced under the owning conversation so the download
+ * endpoint can do membership checks against that conversation's roster.
+ */
+public record ConversationAttachmentDto(
+        Long id,
+        String filename,
+        String contentType,
+        long sizeBytes,
+        String downloadUrl,
+        /** See {@link AttachmentDto#previewUrl()} — same rule, namespaced under the conversation. */
+        String previewUrl,
+        /** See {@link AttachmentDto#previewKind()}. */
+        String previewKind,
+        Instant createdAt,
+        /** See {@link AttachmentDto} — same tombstone, same reason. Null for a live attachment. */
+        Instant deletedAt,
+        String deletedBy,
+        /** See {@link AttachmentDto#videoType()} — same derivation, same reason. */
+        String videoType
+) {
+    public static ConversationAttachmentDto from(ConversationAttachment a) {
+        var convId = a.getMessage().getConversation().getId();
+        boolean gone = a.isDeleted();
+        var kind = gone ? null : PreviewableAttachments.kindOf(a.getFilename(), a.getContentType());
+        return new ConversationAttachmentDto(
+                a.getId(),
+                a.getFilename(),
+                a.getContentType(),
+                a.getSizeBytes(),
+                gone ? null
+                     : "/api/conversations/" + convId + "/attachments/" + a.getId() + "/download",
+                kind == null ? null
+                     : "/api/conversations/" + convId + "/attachments/" + a.getId() + "/" + kind.slug(),
+                kind == null ? null : kind.slug(),
+                a.getCreatedAt(),
+                a.getDeletedAt(),
+                gone ? a.getDeletedByUsername() : null,
+                gone ? null : AttachmentMedia.videoType(a.getContentType(), a.getFilename())
+        );
+    }
+}

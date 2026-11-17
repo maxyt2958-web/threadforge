@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en" xmlns:th="http://www.thymeleaf.org" xmlns:sec="http://www.thymeleaf.org/extras/spring-security">
+<head>
+    <meta charset="utf-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+    <meta name="theme-color" content="#18181b"/>
+    <title th:text="'Admin · ' + ${appTitle}">Admin · ThreadForge</title>
+    <link rel="icon" th:href="${appFaviconUrl}"/>
+    <th:block th:replace="~{fragments/assets :: css('app')}"/>
+    <meta name="_csrf" th:content="${_csrf != null ? _csrf.token : ''}"/>
+    <meta name="_csrf_header" th:content="${_csrf != null ? _csrf.headerName : ''}"/>
+    <th:block th:replace="~{fragments/time-prefs :: metas}"/>
+    <!-- Workspace-admin flag (realm role tforge-admin -> ROLE_ADMIN); read by the avatar
+         dropdown to decide whether to offer the Admin console item. Distinct from the
+         channel-scoped me-is-admin meta on the chat pages. -->
+    <meta name="me-is-workspace-admin" sec:authorize="hasRole('ADMIN')" content="true"/>
+</head>
+<body class="app admin-page" th:attr="data-theme=${me.theme}">
+
+<th:block th:replace="~{fragments/icon-sprite :: sprite}"/>
+
+<header class="topbar">
+    <div class="topbar-left">
+        <a th:href="@{/channels}" class="logo">
+            <th:block th:replace="~{fragments/logo :: mark('logo-mark')}"/>
+            <span class="logo-text" th:text="${appTitle}">ThreadForge</span>
+        </a>
+    </div>
+    <div class="topbar-center"></div>
+    <div class="topbar-right">
+        <a th:href="@{/channels}" class="link-btn">Back to channels</a>
+        <span class="me">
+            <span class="avatar" th:data-author="${me.username}"
+                  th:text="${#strings.toUpperCase(#strings.substring(me.displayName ?: me.username, 0, 1))}">U</span>
+            <span th:text="${me.displayName ?: me.username}">user</span>
+        </span>
+        <!-- Submitted by the avatar dropdown's "Sign out" item (presence-menu.js). -->
+        <form id="logout-form" th:action="@{/logout}" method="post" hidden></form>
+    </div>
+</header>
+
+<main class="admin-content">
+    <div class="admin-wrap">
+        <h1>Admin console</h1>
+
+        <div th:if="${flash}" class="admin-flash" th:text="${flash}">Saved.</div>
+        <div th:if="${error}" class="admin-error" th:text="${error}">Error.</div>
+
+        <section class="admin-section">
+            <h2>Branding</h2>
+            <p class="admin-help">Topbar title and logo. The logo is shown in the topbar, on the
+                landing page, and as the favicon. Falls back to the bundled default when cleared.</p>
+
+            <form th:action="@{/admin/title}" method="post" class="admin-form">
+                <label>
+                    Title
+                    <input type="text" name="title" required maxlength="120"
+                           th:value="${settings.title}"/>
+                </label>
+                <button type="submit">Save title</button>
+            </form>
+
+            <form th:action="@{/admin/logo}" method="post" enctype="multipart/form-data" class="admin-form">
+                <label>
+                    Logo (PNG, JPG, or WebP — max 256&#8239;KB)
+                    <input type="file" name="logo" accept="image/png,image/jpeg,image/webp" required/>
+                </label>
+                <div class="admin-form-row">
+                    <button type="submit">Upload logo</button>
+                    <!-- Filled by admin.js with a blob: URL when a file is picked; rendered at
+                         topbar height so the preview matches how it will actually appear. -->
+                    <span class="admin-current-logo" id="logo-preview-wrap" hidden>
+                        Preview: <img id="logo-preview" alt="" class="logo-mark"/>
+                        <small id="logo-preview-note"></small>
+                    </span>
+                    <span class="admin-current-logo">
+                        Current: <th:block th:replace="~{fragments/logo :: mark('logo-mark')}"/>
+                    </span>
+                </div>
+            </form>
+
+            <form th:if="${settings.hasCustomLogo()}" th:action="@{/admin/logo/clear}" method="post" class="admin-form">
+                <button type="submit" class="link-btn">Reset to default logo</button>
+            </form>
+        </section>
+
+        <section class="admin-section">
+            <h2>Channels <small th:text="'(' + ${#lists.size(channelRows)} + ')'">(0)</small></h2>
+            <div class="admin-table-wrap">
+            <table class="admin-table">
+                <thead>
+                <tr><th>Name</th><th>Type</th><th>Members</th><th>Messages</th><th>Created</th>
+                    <th>Status</th><th>Actions</th></tr>
+                </thead>
+                <tbody>
+                <tr th:each="c : ${channelRows}" th:classappend="${c.archived} ? 'is-archived' : ''">
+                    <td>
+                        <a th:href="@{'/channels/' + ${c.id}}" th:text="'#' + ${c.name}">#general</a>
+                    </td>
+                    <td th:text="${c.type}">PUBLIC</td>
+                    <td th:text="${c.memberCount}">0</td>
+                    <td th:text="${c.messageCount}">0</td>
+                    <td th:text="${fmt.dayKey(c.createdAt)}">2026-01-01</td>
+                    <!--/* This table is the only place in the product that lists every channel there
+                           is: archived ones are out of the sidebar and out of channel search. So it
+                           is where a workspace admin sees what has been archived, and — for a PRIVATE
+                           archived channel whose admins have all left, which cannot be joined and
+                           whose page shows the "ask for an invitation" screen — the only way back. */-->
+                    <td>
+                        <span th:if="${!c.archived}" class="admin-muted">Active</span>
+                        <th:block th:if="${c.archived}">
+                            <span class="admin-archived-mark"
+                                  th:title="|Archived${c.archivedBy != null ? ' by ' + c.archivedBy : ''}${c.archivedAt != null ? ' on ' + fmt.dayKey(c.archivedAt) : ''}|">
+                                Archived</span>
+                            <form th:action="@{'/admin/channels/' + ${c.id} + '/unarchive'}"
+                                  method="post" class="admin-inline-form">
+                                <button type="submit">Unarchive</button>
+                            </form>
+                        </th:block>
+                    </td>
+                    <td class="admin-actions">
+                        <!--/* Delete is workspace-admin only and irreversible, and this is the one
+                               place a workspace admin can reach it for a PRIVATE channel they are
+                               not in — the channel page's own Delete lives in the members-only
+                               settings panel. The typed name is enforced server-side; admin.js only
+                               keeps the button disabled until it matches, so nobody deletes #ops
+                               while aiming at #ops-archive. */-->
+                        <form th:action="@{'/admin/channels/' + ${c.id} + '/delete'}" method="post"
+                              class="admin-inline-form admin-channel-delete"
+                              th:data-channel-name="${c.name}">
+                            <input type="text" name="name" autocomplete="off" spellcheck="false"
+                                   th:placeholder="|type ${c.name} to delete|"
+                                   th:aria-label="|Type ${c.name} to confirm deletion|"/>
+                            <button type="submit" class="admin-danger">Delete</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr th:if="${#lists.isEmpty(channelRows)}">
+                    <td colspan="7" class="admin-empty">No channels yet.</td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+        </section>
+
+        <section class="admin-section">
+            <h2>Permissions</h2>
+            <p class="admin-help">
+                Who may create channels. Slack and Mattermost both default this to everyone and let
+                an admin tighten it; so does this. Tighten it when open registration meets a spam
+                wave — a per-account limit of ten new channels an hour is always in force regardless
+                of this setting, so ordinary use never reaches it.
+            </p>
+            <form th:action="@{/admin/channel-creation}" method="post" class="admin-form">
+                <label>
+                    <input type="radio" name="policy" value="EVERYONE"
+                           th:checked="${channelCreation == 'EVERYONE'}"/>
+                    Everyone can create channels
+                </label>
+                <label>
+                    <input type="radio" name="policy" value="ADMINS_ONLY"
+                           th:checked="${channelCreation == 'ADMINS_ONLY'}"/>
+                    Only administrators
+                </label>
+                <button type="submit">Save permission</button>
+            </form>
+        </section>
+
+        <section class="admin-section">
+            <h2>Privacy</h2>
+            <p class="admin-help">
+                Show full email addresses in the user table below. Off masks them to
+                <code>al…@example.com</code>; default is on for backward compatibility.
+                See <code>README.md</code> for context.
+            </p>
+            <form th:action="@{/admin/email-visibility}" method="post" class="admin-form">
+                <label>
+                    <input type="checkbox" name="expose" value="true"
+                           th:checked="${settings.exposeUserEmails}"/>
+                    Show full emails on this page
+                </label>
+                <button type="submit">Save privacy setting</button>
+            </form>
+        </section>
+
+        <section class="admin-section" id="admin-secrets">
+            <h2>One-time secrets</h2>
+            <p class="admin-help">
+                People can share a password or token through a link that opens once. Allow its creator
+                to let <strong>people without an account</strong> open it — a contractor, a customer.
+                Off means every secret requires sign-in, including ones already shared; nothing is
+                deleted, so turning it back on restores links that have not expired. When someone
+                without an account opens a secret, its creator is shown their IP address and browser.
+            </p>
+            <form th:action="@{/admin/public-secrets}" method="post" class="admin-form">
+                <label>
+                    <input type="checkbox" name="allow" value="true"
+                           th:checked="${settings.allowPublicSecrets}"/>
+                    Allow secrets that anyone with the link can open
+                </label>
+                <button type="submit">Save secrets setting</button>
+            </form>
+        </section>
+
+        <section class="admin-section">
+            <h2>Users <small th:text="'(' + ${#lists.size(userRows)} + ')'">(0)</small></h2>
+            <p class="admin-help">
+                Suspending an account blocks it here immediately and closes its open connections; if
+                Keycloak write-through is enabled it is disabled there too, and you are told when
+                that part did not work. Removing someone's messages is reversible until the
+                retention window expires, so a mistaken ban is recoverable.
+            </p>
+            <p class="admin-help" th:if="${totalStorageBytes != null}">
+                Attachments in use: <strong th:text="${#numbers.formatDecimal(totalStorageBytes / 1048576.0, 1, 1)} + ' MB'">0 MB</strong>.
+                Default quota per person:
+                <strong th:text="${defaultQuotaBytes &lt; 0 ? 'unlimited' : #numbers.formatDecimal(defaultQuotaBytes / 1048576.0, 1, 0) + ' MB'}">2048 MB</strong>.
+            </p>
+            <div class="admin-table-wrap">
+            <table class="admin-table">
+                <thead>
+                <tr>
+                    <th>Username</th><th>Display name</th><th>Email</th>
+                    <th>Storage</th><th>Last active</th><th>Status</th><th>Actions</th>
+                </tr>
+                </thead>
+                <tbody>
+                <tr th:each="u : ${userRows}" th:classappend="${u.suspended} ? 'is-suspended' : ''">
+                    <td th:text="${u.username}">alice</td>
+                    <td th:text="${u.displayName}">Alice Anderson</td>
+                    <td th:text="${u.email}">alice@example.com</td>
+                    <td>
+                        <span th:text="${#numbers.formatDecimal(u.bytesUsed / 1048576.0, 1, 1)} + ' MB'">0.0 MB</span>
+                        <small th:if="${u.effectiveQuotaBytes &gt;= 0}"
+                               th:text="' / ' + ${#numbers.formatDecimal(u.effectiveQuotaBytes / 1048576.0, 1, 0)} + ' MB'"> / 2048 MB</small>
+                        <small th:if="${u.quotaBytes != null}" class="admin-badge" title="Overrides the workspace default">custom</small>
+                    </td>
+                    <td th:text="${u.lastActiveAt != null ? fmt.stamp(u.lastActiveAt) : '—'}">—</td>
+                    <td>
+                        <span th:if="${u.admin}" class="admin-badge">admin</span>
+                        <span th:if="${u.suspended}" class="admin-badge is-danger"
+                              th:title="${u.suspensionNote}">suspended</span>
+                        <span th:unless="${u.admin or u.suspended}">—</span>
+                    </td>
+                    <td class="admin-actions">
+                        <!-- Admins are deliberately not suspendable from here: a suspended admin is
+                             locked out of this console by the same enforcement, so two admins could
+                             suspend each other and leave the workspace with no way back in except
+                             SQL. Remove the tforge-admin role in Keycloak first. -->
+                        <form th:unless="${u.admin or u.suspended}" method="post"
+                              th:action="@{'/admin/users/' + ${u.id} + '/suspend'}" class="admin-inline-form">
+                            <input type="text" name="note" placeholder="reason (optional)" maxlength="500"/>
+                            <button type="submit" class="admin-danger">Suspend</button>
+                        </form>
+                        <form th:if="${u.suspended}" method="post"
+                              th:action="@{'/admin/users/' + ${u.id} + '/unsuspend'}" class="admin-inline-form">
+                            <button type="submit">Restore access</button>
+                        </form>
+                        <!--/* The confirmation is a data attribute read by admin.js, not an inline
+                               onsubmit: the CSP has no 'unsafe-inline' for scripts, so an inline
+                               handler is dropped by the browser — and a purge with a dropped
+                               confirm is a purge with no confirm at all. */-->
+                        <form method="post" th:action="@{'/admin/users/' + ${u.id} + '/messages/purge'}"
+                              class="admin-inline-form"
+                              data-confirm="Remove every message from this account? This is reversible until the retention window expires.">
+                            <button type="submit" class="admin-danger">Clear messages</button>
+                        </form>
+                        <form method="post" th:action="@{'/admin/users/' + ${u.id} + '/messages/restore'}"
+                              class="admin-inline-form">
+                            <button type="submit">Undo clear</button>
+                        </form>
+                        <form method="post" th:action="@{'/admin/users/' + ${u.id} + '/quota'}"
+                              class="admin-inline-form">
+                            <input type="number" name="quotaMb" min="0" step="1" placeholder="MB"
+                                   th:value="${u.quotaBytes != null ? u.quotaBytes / 1048576 : ''}"
+                                   title="Blank resets to the workspace default"/>
+                            <button type="submit">Set quota</button>
+                        </form>
+                    </td>
+                </tr>
+                <tr th:if="${#lists.isEmpty(userRows)}">
+                    <td colspan="7" class="admin-empty">No users yet.</td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+        </section>
+
+        <section class="admin-section">
+            <h2>Audit trail <small th:text="'(newest ' + ${#lists.size(auditRows)} + ')'">(newest 0)</small></h2>
+            <p class="admin-help">
+                Append-only. Nothing in the application edits or deletes these rows: a trail an
+                administrator can quietly revise answers no question worth asking. A blank actor is
+                the scheduled retention purge rather than a person.
+            </p>
+            <div class="admin-table-wrap">
+            <table class="admin-table">
+                <thead>
+                <tr><th>When</th><th>Who</th><th>Action</th><th>Target</th><th>Detail</th></tr>
+                </thead>
+                <tbody>
+                <tr th:each="a : ${auditRows}">
+                    <td th:text="${fmt.stamp(a.createdAt)}">2026-01-01 00:00</td>
+                    <td th:text="${a.actor != null ? a.actor.username : 'system'}">system</td>
+                    <td th:text="${a.action}">user.suspend</td>
+                    <td th:text="${a.targetUser != null ? a.targetUser.username : (a.targetRef ?: '—')}">—</td>
+                    <td class="admin-detail" th:text="${a.detail}">—</td>
+                </tr>
+                <tr th:if="${#lists.isEmpty(auditRows)}">
+                    <td colspan="5" class="admin-empty">Nothing recorded yet.</td>
+                </tr>
+                </tbody>
+            </table>
+            </div>
+        </section>
+
+    </div>
+</main>
+
+<!-- Bundled page scripts (assets.gradle); dev serves the source files. See ASSETS.md. -->
+<th:block th:replace="~{fragments/assets :: js('admin')}"/>
+<!-- Avatar dropdown (presence + sign out); ES module, outside the Closure bundle. -->
+<script type="module" th:src="@{/js/chat/presence-menu-boot.js}" defer></script>
+
+</body>
+</html>
